@@ -1,4 +1,4 @@
-from madrona_escape_room_learn.train import train
+from madrona_escape_room_learn.train import train, train_parallel
 from madrona_escape_room_learn.learning_state import LearningState
 from madrona_escape_room_learn.cfg import TrainConfig, PPOConfig, SimInterface
 from madrona_escape_room_learn.action import DiscreteActionDistributions
@@ -12,7 +12,7 @@ import madrona_escape_room_learn.models
 import madrona_escape_room_learn.rnn
 
 __all__ = [
-        "train", "LearningState", "models", "rnn",
+        "train", "train_parallel", "LearningState", "models", "rnn",
         "TrainConfig", "PPOConfig", "SimInterface",
         "DiscreteActionDistributions",
         "ActorCritic", "DiscreteActor", "Critic",

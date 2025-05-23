@@ -2,7 +2,7 @@ import torch
 import madrona_escape_room
 
 from madrona_escape_room_learn import (
-    train, profile, TrainConfig, PPOConfig, SimInterface,
+    train, train_parallel, profile, TrainConfig, PPOConfig, SimInterface,
 )
 
 from policy import make_policy, setup_obs
@@ -46,8 +46,15 @@ class LearningCallback:
             bootstrap_value_min = update_results.bootstrap_values.min().cpu().item()
             bootstrap_value_max = update_results.bootstrap_values.max().cpu().item()
 
-            vnorm_mu = learning_state.value_normalizer.mu.cpu().item()
-            vnorm_sigma = learning_state.value_normalizer.sigma.cpu().item()
+            # Handle both single and parallel training states
+            if hasattr(learning_state, 'value_normalizer'):
+                vnorm_mu = learning_state.value_normalizer.mu.cpu().item()
+                vnorm_sigma = learning_state.value_normalizer.sigma.cpu().item()
+            else:
+                # For parallel training, use the best policy's normalizer
+                best_idx = learning_state.best_policy_idx
+                vnorm_mu = learning_state.value_normalizers[best_idx].mu.cpu().item()
+                vnorm_sigma = learning_state.value_normalizers[best_idx].sigma.cpu().item()
 
         print(f"\nUpdate: {update_id}")
         print(f"    Loss: {ppo.loss: .3e}, A: {ppo.action_loss: .3e}, V: {ppo.value_loss: .3e}, E: {ppo.entropy_loss: .3e}")
@@ -59,6 +66,10 @@ class LearningCallback:
         print(f"    Returns          => Avg: {ppo.returns_mean}, σ: {ppo.returns_stddev}")
         print(f"    Value Normalizer => Mean: {vnorm_mu: .3e}, σ: {vnorm_sigma :.3e}")
 
+        if hasattr(learning_state, 'policy_returns'):
+            print(f"    Policy Returns   => {[f'{r:.3e}' for r in learning_state.policy_returns]}")
+            print(f"    Best Policy      => {learning_state.best_policy_idx}")
+
         if self.profile_report:
             print()
             print(f"    FPS: {fps:.0f}, Update Time: {update_time:.2f}, Avg FPS: {self.mean_fps:.0f}")
@@ -66,7 +77,12 @@ class LearningCallback:
             profile.report()
 
         if update_id % 100 == 0:
-            learning_state.save(update_idx, self.ckpt_dir / f"{update_id}.pth")
+            if hasattr(learning_state, 'save'):
+                learning_state.save(update_idx, self.ckpt_dir / f"{update_id}.pth")
+            else:
+                # For parallel training, save the best policy
+                best_policy = learning_state.policies[learning_state.best_policy_idx]
+                torch.save(best_policy.state_dict(), self.ckpt_dir / f"{update_id}.pth")
 
 
 arg_parser = argparse.ArgumentParser()
@@ -91,6 +107,8 @@ arg_parser.add_argument('--fp16', action='store_true')
 
 arg_parser.add_argument('--gpu-sim', action='store_true')
 arg_parser.add_argument('--profile-report', action='store_true')
+arg_parser.add_argument('--parallel-training', action='store_true', help='Enable parallel policy training')
+arg_parser.add_argument('--num-parallel-policies', type=int, default=4, help='Number of policies to train in parallel')
 
 args = arg_parser.parse_args()
 
@@ -130,35 +148,51 @@ if args.restore:
 else:
     restore_ckpt = None
 
-train(
-    dev,
-    SimInterface(
-            step = lambda: sim.step(),
-            obs = obs,
-            actions = actions,
-            dones = dones,
-            rewards = rewards,
+train_config = TrainConfig(
+    num_updates = args.num_updates,
+    steps_per_update = args.steps_per_update,
+    num_bptt_chunks = args.num_bptt_chunks,
+    lr = args.lr,
+    gamma = args.gamma,
+    gae_lambda = 0.95,
+    ppo = PPOConfig(
+        num_mini_batches=1,
+        clip_coef=0.2,
+        value_loss_coef=args.value_loss_coef,
+        entropy_coef=args.entropy_loss_coef,
+        max_grad_norm=0.5,
+        num_epochs=2,
+        clip_value_loss=args.clip_value_loss,
     ),
-    TrainConfig(
-        num_updates = args.num_updates,
-        steps_per_update = args.steps_per_update,
-        num_bptt_chunks = args.num_bptt_chunks,
-        lr = args.lr,
-        gamma = args.gamma,
-        gae_lambda = 0.95,
-        ppo = PPOConfig(
-            num_mini_batches=1,
-            clip_coef=0.2,
-            value_loss_coef=args.value_loss_coef,
-            entropy_coef=args.entropy_loss_coef,
-            max_grad_norm=0.5,
-            num_epochs=2,
-            clip_value_loss=args.clip_value_loss,
-        ),
-        value_normalizer_decay = 0.999,
-        mixed_precision = args.fp16,
-    ),
-    policy,
-    learning_cb,
-    restore_ckpt
+    value_normalizer_decay = 0.999,
+    mixed_precision = args.fp16,
 )
+
+sim_interface = SimInterface(
+    step = lambda: sim.step(),
+    obs = obs,
+    actions = actions,
+    dones = dones,
+    rewards = rewards,
+)
+
+if args.parallel_training:
+    print(f"Starting parallel training with {args.num_parallel_policies} policies")
+    train_parallel(
+        dev,
+        sim_interface,
+        train_config,
+        policy,
+        learning_cb,
+        restore_ckpt,
+        num_parallel_policies=args.num_parallel_policies
+    )
+else:
+    train(
+        dev,
+        sim_interface,
+        train_config,
+        policy,
+        learning_cb,
+        restore_ckpt
+    )

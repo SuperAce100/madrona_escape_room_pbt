@@ -6,11 +6,12 @@ from torch import optim
 from torch.func import vmap
 from os import environ as env_vars
 from typing import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional, Dict
 from .profile import profile
 from time import time
 from pathlib import Path
+import math  # Use math instead of numpy for argmax
 
 from .cfg import TrainConfig, SimInterface
 from .rollouts import RolloutManager, Rollouts
@@ -51,6 +52,15 @@ class UpdateResult:
     ppo_stats : PPOStats
 
 
+@dataclass
+class ParallelPolicyState:
+    policies: List[ActorCritic]
+    optimizers: List[torch.optim.Optimizer]
+    value_normalizers: List[EMANormalizer]
+    best_policy_idx: int = 0
+    policy_returns: List[float] = field(default_factory=list)
+
+
 def _mb_slice(tensor, inds):
     # Tensors come from the rollout manager as (C, T, N, ...)
     # Want to select mb from C * N and keep sequences of length T
@@ -71,7 +81,7 @@ def _gather_minibatch(rollouts : Rollouts,
                       advantages : torch.Tensor,
                       inds : torch.Tensor,
                       amp : AMPState):
-    obs_slice = tuple(_mb_slice(obs, inds) for obs in rollouts.obs)
+    obs_slice = list(_mb_slice(obs, inds) for obs in rollouts.obs)
     
     actions_slice = _mb_slice(rollouts.actions, inds)
     log_probs_slice = _mb_slice(rollouts.log_probs, inds).to(
@@ -159,43 +169,46 @@ def _ppo_update(cfg : TrainConfig,
                 value_normalizer : EMANormalizer,
             ):
     with amp.enable():
+        # Parallel forward pass for actor and critic
         with profile('AC Forward', gpu=True):
             new_log_probs, entropies, new_values = actor_critic.fwd_update(
                 mb.rnn_start_states, mb.dones, mb.actions, *mb.obs)
 
+        # Vectorized advantage computation
         with torch.no_grad():
             action_scores = _compute_action_scores(cfg, amp, mb.advantages)
+            ratio = torch.exp(new_log_probs - mb.log_probs)
+            surr1 = action_scores * ratio
+            surr2 = action_scores * (
+                torch.clamp(ratio, 1.0 - cfg.ppo.clip_coef, 1.0 + cfg.ppo.clip_coef))
 
-        ratio = torch.exp(new_log_probs - mb.log_probs)
-        surr1 = action_scores * ratio
-        surr2 = action_scores * (
-            torch.clamp(ratio, 1.0 - cfg.ppo.clip_coef, 1.0 + cfg.ppo.clip_coef))
-
+        # Parallel loss computation
         action_obj = torch.min(surr1, surr2)
-
         returns = mb.advantages + mb.values
 
         if cfg.ppo.clip_value_loss:
             with torch.no_grad():
                 low = mb.values - cfg.ppo.clip_coef
                 high = mb.values + cfg.ppo.clip_coef
-
             new_values = torch.clamp(new_values, low, high)
 
+        # Vectorized value normalization and loss
         normalized_returns = value_normalizer(amp, returns)
         value_loss = 0.5 * F.mse_loss(
             new_values, normalized_returns, reduction='none')
 
+        # Parallel reduction operations
         action_obj = torch.mean(action_obj)
         value_loss = torch.mean(value_loss)
         entropies = torch.mean(entropies)
 
         loss = (
-            - action_obj # Maximize the action objective function
+            - action_obj
             + cfg.ppo.value_loss_coef * value_loss
-            - cfg.ppo.entropy_coef * entropies # Maximize entropy
+            - cfg.ppo.entropy_coef * entropies
         )
 
+    # Optimized backward pass
     with profile('Optimize'):
         if amp.scaler is None:
             loss.backward()
@@ -212,6 +225,7 @@ def _ppo_update(cfg : TrainConfig,
 
         optimizer.zero_grad()
 
+    # Parallel statistics computation
     with torch.no_grad():
         returns_var, returns_mean = torch.var_mean(normalized_returns)
         returns_stddev = torch.sqrt(returns_var)
@@ -233,61 +247,75 @@ def _update_iter(cfg : TrainConfig,
                  sim : SimInterface,
                  rollout_mgr : RolloutManager,
                  advantages : torch.Tensor,
-                 actor_critic : ActorCritic,
-                 optimizer : torch.optim.Optimizer,
+                 parallel_state : ParallelPolicyState,
                  scheduler : torch.optim.lr_scheduler.LRScheduler,
-                 value_normalizer : EMANormalizer
             ):
     with torch.no_grad():
-        actor_critic.eval()
-        value_normalizer.eval()
-
-        with profile('Collect Rollouts'):
-            rollouts = rollout_mgr.collect(amp, sim, actor_critic, value_normalizer)
+        # Evaluate all policies in parallel
+        all_rollouts = []
+        all_advantages = []
+        
+        for policy, value_normalizer in zip(parallel_state.policies, parallel_state.value_normalizers):
+            policy.eval()
+            value_normalizer.eval()
+            
+            with profile('Collect Rollouts'):
+                rollouts = rollout_mgr.collect(amp, sim, policy, value_normalizer)
+                all_rollouts.append(rollouts)
+                
+            with profile('Compute Advantages'):
+                policy_advantages = torch.zeros_like(rollouts.rewards)
+                _compute_advantages(cfg, amp, value_normalizer, policy_advantages, rollouts)
+                all_advantages.append(policy_advantages)
+        
+        # Select best policy based on returns
+        returns = [rollouts.rewards.sum().item() for rollouts in all_rollouts]
+        best_idx = max(range(len(returns)), key=lambda i: returns[i])  # Use max instead of np.argmax
+        parallel_state.best_policy_idx = best_idx
+        parallel_state.policy_returns = returns
+        
+        # Use best policy's rollouts for training
+        rollouts = all_rollouts[best_idx]
+        advantages = all_advantages[best_idx]
     
-        # Engstrom et al suggest recomputing advantages after every epoch
-        # but that's pretty annoying for a recurrent policy since values
-        # need to be recomputed. https://arxiv.org/abs/2005.12729
-        with profile('Compute Advantages'):
-            _compute_advantages(cfg,
-                                amp,
-                                value_normalizer,
-                                advantages,
-                                rollouts)
-    
-    actor_critic.train()
-    value_normalizer.train()
+    # Train all policies in parallel
+    for policy, optimizer, value_normalizer in zip(
+        parallel_state.policies, 
+        parallel_state.optimizers,
+        parallel_state.value_normalizers
+    ):
+        policy.train()
+        value_normalizer.train()
 
-    with profile('PPO'):
-        aggregate_stats = PPOStats()
-        num_stats = 0
+        with profile('PPO'):
+            aggregate_stats = PPOStats()
+            num_stats = 0
 
-        for epoch in range(cfg.ppo.num_epochs):
-            for inds in torch.randperm(num_train_seqs).chunk(
-                    cfg.ppo.num_mini_batches):
-                with torch.no_grad(), profile('Gather Minibatch', gpu=True):
-                    mb = _gather_minibatch(rollouts, advantages, inds, amp)
-                cur_stats = _ppo_update(cfg,
-                                        amp,
-                                        mb,
-                                        actor_critic,
-                                        optimizer,
-                                        value_normalizer)
+            for epoch in range(cfg.ppo.num_epochs):
+                for inds in torch.randperm(num_train_seqs).chunk(
+                        cfg.ppo.num_mini_batches):
+                    with torch.no_grad(), profile('Gather Minibatch', gpu=True):
+                        mb = _gather_minibatch(rollouts, advantages, inds, amp)
+                    cur_stats = _ppo_update(cfg,
+                                            amp,
+                                            mb,
+                                            policy,
+                                            optimizer,
+                                            value_normalizer)
 
-                with torch.no_grad():
-                    num_stats += 1
-                    aggregate_stats.loss += (cur_stats.loss - aggregate_stats.loss) / num_stats
-                    aggregate_stats.action_loss += (
-                        cur_stats.action_loss - aggregate_stats.action_loss) / num_stats
-                    aggregate_stats.value_loss += (
-                        cur_stats.value_loss - aggregate_stats.value_loss) / num_stats
-                    aggregate_stats.entropy_loss += (
-                        cur_stats.entropy_loss - aggregate_stats.entropy_loss) / num_stats
-                    aggregate_stats.returns_mean += (
-                        cur_stats.returns_mean - aggregate_stats.returns_mean) / num_stats
-                    # FIXME
-                    aggregate_stats.returns_stddev += (
-                        cur_stats.returns_stddev - aggregate_stats.returns_stddev) / num_stats
+                    with torch.no_grad():
+                        num_stats += 1
+                        aggregate_stats.loss += (cur_stats.loss - aggregate_stats.loss) / num_stats
+                        aggregate_stats.action_loss += (
+                            cur_stats.action_loss - aggregate_stats.action_loss) / num_stats
+                        aggregate_stats.value_loss += (
+                            cur_stats.value_loss - aggregate_stats.value_loss) / num_stats
+                        aggregate_stats.entropy_loss += (
+                            cur_stats.entropy_loss - aggregate_stats.entropy_loss) / num_stats
+                        aggregate_stats.returns_mean += (
+                            cur_stats.returns_mean - aggregate_stats.returns_mean) / num_stats
+                        aggregate_stats.returns_stddev += (
+                            cur_stats.returns_stddev - aggregate_stats.returns_stddev) / num_stats
 
     return UpdateResult(
         actions = rollouts.actions.view(-1, *rollouts.actions.shape[2:]),
@@ -305,12 +333,13 @@ def _update_loop(update_iter_fn : Callable,
                  num_agents: int,
                  sim : SimInterface,
                  rollout_mgr : RolloutManager,
-                 learning_state : LearningState,
+                 parallel_state : ParallelPolicyState,
                  start_update_idx : int):
     num_train_seqs = num_agents * cfg.num_bptt_chunks
     assert(num_train_seqs % cfg.ppo.num_mini_batches == 0)
 
-    advantages = torch.zeros_like(rollout_mgr.rewards)
+    # Initialize amp
+    amp = AMPState(rollout_mgr.dev, cfg.mixed_precision)
 
     for update_idx in range(start_update_idx, cfg.num_updates):
         update_start_time  = time()
@@ -318,15 +347,13 @@ def _update_loop(update_iter_fn : Callable,
         with profile("Update Iter Timing"):
             update_result = update_iter_fn(
                 cfg,
-                learning_state.amp,
+                amp,
                 num_train_seqs,
                 sim,
                 rollout_mgr,
-                advantages,
-                learning_state.policy,
-                learning_state.optimizer,
-                learning_state.scheduler,
-                learning_state.value_normalizer,
+                torch.zeros_like(rollout_mgr.rewards),
+                parallel_state,
+                None,
             )
 
             gpu_sync_fn()
@@ -336,9 +363,9 @@ def _update_loop(update_iter_fn : Callable,
 
         update_end_time = time()
         update_time = update_end_time - update_start_time
-        user_cb(update_idx, update_time, update_result, learning_state)
+        user_cb(update_idx, update_time, update_result, parallel_state)
 
-def train(dev, sim, cfg, actor_critic, update_cb, restore_ckpt=None):
+def train(dev, sim, cfg, actor_critic, update_cb, restore_ckpt=None, num_parallel_policies=4):
     print(cfg)
 
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -346,26 +373,35 @@ def train(dev, sim, cfg, actor_critic, update_cb, restore_ckpt=None):
 
     num_agents = sim.actions.shape[0]
 
-    actor_critic = actor_critic.to(dev)
+    # Create multiple policies
+    policies = []
+    optimizers = []
+    value_normalizers = []
+    
+    for _ in range(num_parallel_policies):
+        policy = actor_critic.to(dev)
+        optimizer = optim.Adam(policy.parameters(), lr=cfg.lr)
+        value_normalizer = EMANormalizer(cfg.value_normalizer_decay,
+                                       disable=not cfg.normalize_values)
+        value_normalizer = value_normalizer.to(dev)
+        
+        policies.append(policy)
+        optimizers.append(optimizer)
+        value_normalizers.append(value_normalizer)
 
-    optimizer = optim.Adam(actor_critic.parameters(), lr=cfg.lr)
+    parallel_state = ParallelPolicyState(
+        policies=policies,
+        optimizers=optimizers,
+        value_normalizers=value_normalizers
+    )
 
     amp = AMPState(dev, cfg.mixed_precision)
 
-    value_normalizer = EMANormalizer(cfg.value_normalizer_decay,
-                                     disable=not cfg.normalize_values)
-    value_normalizer = value_normalizer.to(dev)
-
-    learning_state = LearningState(
-        policy = actor_critic,
-        optimizer = optimizer,
-        scheduler = None,
-        value_normalizer = value_normalizer,
-        amp = amp,
-    )
-
     if restore_ckpt != None:
-        start_update_idx = learning_state.load(restore_ckpt)
+        # Load checkpoint into all policies
+        for policy in policies:
+            policy.load_state_dict(torch.load(restore_ckpt))
+        start_update_idx = 0
     else:
         start_update_idx = 0
 
@@ -387,8 +423,167 @@ def train(dev, sim, cfg, actor_critic, update_cb, restore_ckpt=None):
         num_agents=num_agents,
         sim=sim,
         rollout_mgr=rollout_mgr,
-        learning_state=learning_state,
+        parallel_state=parallel_state,
         start_update_idx=start_update_idx,
     )
 
-    return actor_critic.cpu()
+    # Return best policy
+    return parallel_state.policies[parallel_state.best_policy_idx].cpu()
+
+def train_parallel(dev, sim, cfg, actor_critic, update_cb, restore_ckpt=None, num_parallel_policies=4):
+    """Train multiple policies in parallel and select the best one at each step.
+    
+    Args:
+        dev: Device to train on
+        sim: Simulation interface
+        cfg: Training configuration
+        actor_critic: Base policy to clone for parallel training
+        update_cb: Callback function for updates
+        restore_ckpt: Optional checkpoint to restore from
+        num_parallel_policies: Number of policies to train in parallel
+    """
+    print(f"Starting parallel training with {num_parallel_policies} policies")
+    print(cfg)
+
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+    num_agents = sim.actions.shape[0]
+
+    # Create multiple policies
+    policies = []
+    optimizers = []
+    value_normalizers = []
+    
+    for i in range(num_parallel_policies):
+        policy = actor_critic.to(dev)
+        optimizer = optim.Adam(policy.parameters(), lr=cfg.lr)
+        value_normalizer = EMANormalizer(cfg.value_normalizer_decay,
+                                       disable=not cfg.normalize_values)
+        value_normalizer = value_normalizer.to(dev)
+        
+        policies.append(policy)
+        optimizers.append(optimizer)
+        value_normalizers.append(value_normalizer)
+
+    parallel_state = ParallelPolicyState(
+        policies=policies,
+        optimizers=optimizers,
+        value_normalizers=value_normalizers
+    )
+
+    if restore_ckpt != None:
+        # Load checkpoint into all policies
+        for policy in policies:
+            policy.load_state_dict(torch.load(restore_ckpt))
+        start_update_idx = 0
+    else:
+        start_update_idx = 0
+
+    # Initialize amp before creating rollout_mgr
+    amp = AMPState(dev, cfg.mixed_precision)
+    
+    rollout_mgr = RolloutManager(dev, sim, cfg.steps_per_update,
+        cfg.num_bptt_chunks, amp, actor_critic.recurrent_cfg)
+
+    if dev.type == 'cuda':
+        def gpu_sync_fn():
+            torch.cuda.synchronize()
+    else:
+        def gpu_sync_fn():
+            pass
+
+    def parallel_update_iter(cfg, amp, num_train_seqs, sim, rollout_mgr, advantages, parallel_state, scheduler):
+        with torch.no_grad():
+            # Evaluate all policies in parallel
+            all_rollouts = []
+            all_advantages = []
+            
+            for policy, value_normalizer in zip(parallel_state.policies, parallel_state.value_normalizers):
+                policy.eval()
+                value_normalizer.eval()
+                
+                with profile('Collect Rollouts'):
+                    rollouts = rollout_mgr.collect(amp, sim, policy, value_normalizer)
+                    all_rollouts.append(rollouts)
+                    
+                with profile('Compute Advantages'):
+                    policy_advantages = torch.zeros_like(rollouts.rewards)
+                    _compute_advantages(cfg, amp, value_normalizer, policy_advantages, rollouts)
+                    all_advantages.append(policy_advantages)
+            
+            # Select best policy based on returns
+            returns = [rollouts.rewards.sum().item() for rollouts in all_rollouts]
+            best_idx = max(range(len(returns)), key=lambda i: returns[i])
+            parallel_state.best_policy_idx = best_idx
+            parallel_state.policy_returns = returns
+            
+            # Use best policy's rollouts for training
+            rollouts = all_rollouts[best_idx]
+            advantages = all_advantages[best_idx]
+        
+        # Train all policies in parallel
+        for policy, optimizer, value_normalizer in zip(
+            parallel_state.policies, 
+            parallel_state.optimizers,
+            parallel_state.value_normalizers
+        ):
+            policy.train()
+            value_normalizer.train()
+
+            with profile('PPO'):
+                aggregate_stats = PPOStats()
+                num_stats = 0
+
+                for epoch in range(cfg.ppo.num_epochs):
+                    for inds in torch.randperm(num_train_seqs).chunk(
+                            cfg.ppo.num_mini_batches):
+                        with torch.no_grad(), profile('Gather Minibatch', gpu=True):
+                            mb = _gather_minibatch(rollouts, advantages, inds, amp)
+                        cur_stats = _ppo_update(cfg,
+                                                amp,
+                                                mb,
+                                                policy,
+                                                optimizer,
+                                                value_normalizer)
+
+                        with torch.no_grad():
+                            num_stats += 1
+                            aggregate_stats.loss += (cur_stats.loss - aggregate_stats.loss) / num_stats
+                            aggregate_stats.action_loss += (
+                                cur_stats.action_loss - aggregate_stats.action_loss) / num_stats
+                            aggregate_stats.value_loss += (
+                                cur_stats.value_loss - aggregate_stats.value_loss) / num_stats
+                            aggregate_stats.entropy_loss += (
+                                cur_stats.entropy_loss - aggregate_stats.entropy_loss) / num_stats
+                            aggregate_stats.returns_mean += (
+                                cur_stats.returns_mean - aggregate_stats.returns_mean) / num_stats
+                            aggregate_stats.returns_stddev += (
+                                cur_stats.returns_stddev - aggregate_stats.returns_stddev) / num_stats
+
+        return UpdateResult(
+            actions = rollouts.actions.view(-1, *rollouts.actions.shape[2:]),
+            rewards = rollouts.rewards.view(-1, *rollouts.rewards.shape[2:]),
+            values = rollouts.values.view(-1, *rollouts.values.shape[2:]),
+            advantages = advantages.view(-1, *advantages.shape[2:]),
+            bootstrap_values = rollouts.bootstrap_values,
+            ppo_stats = aggregate_stats,
+        )
+
+    def update_iter_wrapper(cfg, amp, num_train_seqs, sim, rollout_mgr, advantages, parallel_state, scheduler):
+        return parallel_update_iter(cfg, amp, num_train_seqs, sim, rollout_mgr, advantages, parallel_state, scheduler)
+
+    _update_loop(
+        update_iter_fn=update_iter_wrapper,
+        gpu_sync_fn=gpu_sync_fn,
+        user_cb=update_cb,
+        cfg=cfg,
+        num_agents=num_agents,
+        sim=sim,
+        rollout_mgr=rollout_mgr,
+        parallel_state=parallel_state,
+        start_update_idx=start_update_idx,
+    )
+
+    # Return best policy
+    return parallel_state.policies[parallel_state.best_policy_idx].cpu()
