@@ -69,6 +69,12 @@ class LearningCallback:
         if hasattr(learning_state, 'policy_returns'):
             print(f"    Policy Returns   => {[f'{r:.3e}' for r in learning_state.policy_returns]}")
             print(f"    Best Policy      => {learning_state.best_policy_idx}")
+            print("\n    Policy Hyperparameters:")
+            for i, policy in enumerate(learning_state.policies):
+                print(f"      Policy {i}:")
+                print(f"        LR: {policy.hyperparams['lr']:.2e}")
+                print(f"        Entropy: {policy.hyperparams['entropy_coef']:.2e}")
+                print(f"        Value Loss: {policy.hyperparams['value_loss_coef']:.2e}")
 
         if self.profile_report:
             print()
