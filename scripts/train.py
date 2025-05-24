@@ -121,7 +121,7 @@ args = arg_parser.parse_args()
 sim = madrona_escape_room.SimManager(
     exec_mode = madrona_escape_room.madrona.ExecMode.CUDA if args.gpu_sim else madrona_escape_room.madrona.ExecMode.CPU,
     gpu_id = args.gpu_id,
-    num_worlds = args.num_worlds,
+    num_worlds = args.num_worlds // args.num_parallel_policies,
     rand_seed = 5,
     auto_reset = True,
 )
@@ -194,11 +194,12 @@ if args.parallel_training:
         num_parallel_policies=args.num_parallel_policies
     )
 else:
-    train(
+    train_parallel(
         dev,
         sim_interface,
         train_config,
         policy,
         learning_cb,
-        restore_ckpt
+        restore_ckpt,
+        num_parallel_policies=1
     )

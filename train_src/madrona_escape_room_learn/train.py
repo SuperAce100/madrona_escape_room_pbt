@@ -266,7 +266,7 @@ def _update_iter(cfg : TrainConfig,
                 steps_per_update=cfg.steps_per_update,
                 num_bptt_chunks=cfg.num_bptt_chunks,
                 lr=policy.hyperparams['lr'],
-                gamma=cfg.gamma,
+                gamma=policy.hyperparams['gamma'],
                 gae_lambda=cfg.gae_lambda,
                 ppo=PPOConfig(
                     num_mini_batches=cfg.ppo.num_mini_batches,
@@ -292,7 +292,7 @@ def _update_iter(cfg : TrainConfig,
         
         # Select best policy based on returns
         returns = [rollouts.rewards.sum().item() for rollouts in all_rollouts]
-        best_idx = max(range(len(returns)), key=lambda i: returns[i])  # Use max instead of np.argmax
+        best_idx = max(range(len(returns)), key=lambda i: returns[i])
         parallel_state.best_policy_idx = best_idx
         parallel_state.policy_returns = returns
     
@@ -315,7 +315,7 @@ def _update_iter(cfg : TrainConfig,
                 steps_per_update=cfg.steps_per_update,
                 num_bptt_chunks=cfg.num_bptt_chunks,
                 lr=policy.hyperparams['lr'],
-                gamma=cfg.gamma,
+                gamma=policy.hyperparams['gamma'],
                 gae_lambda=cfg.gae_lambda,
                 ppo=PPOConfig(
                     num_mini_batches=cfg.ppo.num_mini_batches,
@@ -512,25 +512,28 @@ def train_parallel(dev, sim, cfg, actor_critic, update_cb, restore_ckpt=None, nu
     value_normalizers = []
     rollout_managers = []
     
-    # Generate diverse hyperparameters
-    base_lr = cfg.lr
-    base_entropy = cfg.ppo.entropy_coef
-    base_value = cfg.ppo.value_loss_coef
-    
-    # Log space ranges for hyperparameters
-    lr_range = (base_lr * 0.1, base_lr * 10.0)  # 10x range
-    entropy_range = (base_entropy * 0.1, base_entropy * 10.0)  # 10x range
-    value_range = (base_value * 0.5, base_value * 2.0)  # 4x range
+    # Default hyperparameters
+    default_lr = 1e-4
+    default_gamma = 0.998
+    default_entropy = 0.01
+    default_value = 0.5
     
     # Initialize amp before creating rollout managers
     amp = AMPState(dev, cfg.mixed_precision)
     
     for i in range(num_parallel_policies):
-        # Generate hyperparameters in log space
-        t = i / (num_parallel_policies - 1) if num_parallel_policies > 1 else 0.5
-        policy_lr = math.exp(math.log(lr_range[0]) * (1 - t) + math.log(lr_range[1]) * t)
-        policy_entropy = math.exp(math.log(entropy_range[0]) * (1 - t) + math.log(entropy_range[1]) * t)
-        policy_value = math.exp(math.log(value_range[0]) * (1 - t) + math.log(value_range[1]) * t)
+        # Generate random hyperparameters using log-normal distribution
+        # Scale factor of 0.5 means most values will be within 50% of the default
+        scale = 0.5
+        
+        # Generate random values in log space
+        policy_lr = default_lr * math.exp(torch.randn(1).item() * scale)
+        policy_gamma = default_gamma * math.exp(torch.randn(1).item() * scale)
+        policy_entropy = default_entropy * math.exp(torch.randn(1).item() * scale)
+        policy_value = default_value * math.exp(torch.randn(1).item() * scale)
+        
+        # Clamp gamma to valid range
+        policy_gamma = max(0.9, min(0.999, policy_gamma))
         
         # Create policy with modified config
         policy = actor_critic.to(dev)
@@ -546,10 +549,17 @@ def train_parallel(dev, sim, cfg, actor_critic, update_cb, restore_ckpt=None, nu
         # Store hyperparameters in policy for logging
         policy.hyperparams = {
             'lr': policy_lr,
+            'gamma': policy_gamma,
             'entropy_coef': policy_entropy,
             'value_loss_coef': policy_value,
             'worlds_per_policy': worlds_per_policy
         }
+        
+        # print(f"Policy {i} hyperparameters:")
+        # print(f"  Learning rate: {policy_lr:.2e}")
+        # print(f"  Gamma: {policy_gamma:.3f}")
+        # print(f"  Entropy coefficient: {policy_entropy:.3f}")
+        # print(f"  Value loss coefficient: {policy_value:.3f}")
         
         policies.append(policy)
         optimizers.append(optimizer)
@@ -631,7 +641,7 @@ def train_parallel(dev, sim, cfg, actor_critic, update_cb, restore_ckpt=None, nu
                     steps_per_update=cfg.steps_per_update,
                     num_bptt_chunks=cfg.num_bptt_chunks,
                     lr=policy.hyperparams['lr'],
-                    gamma=cfg.gamma,
+                    gamma=policy.hyperparams['gamma'],
                     gae_lambda=cfg.gae_lambda,
                     ppo=PPOConfig(
                         num_mini_batches=cfg.ppo.num_mini_batches,
