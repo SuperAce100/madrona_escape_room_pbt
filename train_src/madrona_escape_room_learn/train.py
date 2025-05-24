@@ -5,13 +5,16 @@ import torch._dynamo
 from torch import optim
 from torch.func import vmap
 from os import environ as env_vars
-from typing import Callable
+from typing import Callable, Optional
 from dataclasses import dataclass, field
-from typing import List, Optional, Dict
+from typing import List, Dict
 from .profile import profile
 from time import time
 from pathlib import Path
 import math  # Use math instead of numpy for argmax
+from torch.utils.tensorboard import SummaryWriter
+import json
+from datetime import datetime
 
 from .cfg import TrainConfig, SimInterface, PPOConfig
 from .rollouts import RolloutManager, Rollouts
@@ -60,6 +63,8 @@ class ParallelPolicyState:
     rollout_managers: List[RolloutManager]
     best_policy_idx: int = 0
     policy_returns: List[float] = field(default_factory=list)
+    best_policy_returns: List[float] = field(default_factory=list)
+    best_policy_stats: List[PPOStats] = field(default_factory=list)
 
 
 def _mb_slice(tensor, inds):
@@ -250,13 +255,18 @@ def _update_iter(cfg : TrainConfig,
                  advantages : torch.Tensor,
                  parallel_state : ParallelPolicyState,
                  scheduler : torch.optim.lr_scheduler.LRScheduler,
-            ):
+                 update_idx : int,
+                 writer : Optional[SummaryWriter] = None):
     with torch.no_grad():
         # Evaluate all policies in parallel
         all_rollouts = []
         all_advantages = []
         
-        for policy, value_normalizer in zip(parallel_state.policies, parallel_state.value_normalizers):
+        for i, (policy, value_normalizer, rollout_mgr) in enumerate(zip(
+            parallel_state.policies, 
+            parallel_state.value_normalizers,
+            parallel_state.rollout_managers
+        )):
             policy.eval()
             value_normalizer.eval()
             
@@ -280,7 +290,7 @@ def _update_iter(cfg : TrainConfig,
                 value_normalizer_decay=cfg.value_normalizer_decay,
                 mixed_precision=cfg.mixed_precision,
             )
-            
+
             with profile('Collect Rollouts'):
                 rollouts = rollout_mgr.collect(amp, sim, policy, value_normalizer)
                 all_rollouts.append(rollouts)
@@ -295,8 +305,22 @@ def _update_iter(cfg : TrainConfig,
         best_idx = max(range(len(returns)), key=lambda i: returns[i])
         parallel_state.best_policy_idx = best_idx
         parallel_state.policy_returns = returns
+        
+        # Track best policy's returns
+        parallel_state.best_policy_returns.append(returns[best_idx])
+        
+        # Log returns for each policy if writer is provided
+        if writer is not None:
+            for i, ret in enumerate(returns):
+                writer.add_scalar(f"policy_{i}/returns", ret, update_idx)
+            writer.add_scalar("best_policy_idx", best_idx, update_idx)
+            writer.add_scalar("best_policy/returns", returns[best_idx], update_idx)
     
-    # Train each policy using its own rollouts and hyperparameters
+    # Use best policy's rollouts and advantages for all policies
+    best_rollouts = all_rollouts[best_idx]
+    best_advantages = all_advantages[best_idx]
+    
+    # Train each policy using best policy's rollouts and advantages
     for i, (policy, optimizer, value_normalizer) in enumerate(zip(
         parallel_state.policies, 
         parallel_state.optimizers,
@@ -330,21 +354,18 @@ def _update_iter(cfg : TrainConfig,
                 mixed_precision=cfg.mixed_precision,
             )
 
-            # Use this policy's own rollouts and advantages
-            policy_rollouts = all_rollouts[i]
-            policy_advantages = all_advantages[i]
-
+            # Use best policy's rollouts and advantages for all policies
             for epoch in range(policy_cfg.ppo.num_epochs):
                 for inds in torch.randperm(num_train_seqs).chunk(
                         policy_cfg.ppo.num_mini_batches):
                     with torch.no_grad(), profile('Gather Minibatch', gpu=True):
-                        mb = _gather_minibatch(policy_rollouts, policy_advantages, inds, amp)
+                        mb = _gather_minibatch(best_rollouts, best_advantages, inds, amp)
                     cur_stats = _ppo_update(policy_cfg,
-                                            amp,
-                                            mb,
-                                            policy,
-                                            optimizer,
-                                            value_normalizer)
+                                          amp,
+                                          mb,
+                                          policy,
+                                          optimizer,
+                                          value_normalizer)
 
                     with torch.no_grad():
                         num_stats += 1
@@ -359,16 +380,36 @@ def _update_iter(cfg : TrainConfig,
                             cur_stats.returns_mean - aggregate_stats.returns_mean) / num_stats
                         aggregate_stats.returns_stddev += (
                             cur_stats.returns_stddev - aggregate_stats.returns_stddev) / num_stats
+            
+            # Track best policy's stats
+            if i == best_idx:
+                parallel_state.best_policy_stats.append(aggregate_stats)
+            
+            # Log training metrics for each policy if writer is provided
+            if writer is not None:
+                writer.add_scalar(f"policy_{i}/loss", aggregate_stats.loss, update_idx)
+                writer.add_scalar(f"policy_{i}/action_loss", aggregate_stats.action_loss, update_idx)
+                writer.add_scalar(f"policy_{i}/value_loss", aggregate_stats.value_loss, update_idx)
+                writer.add_scalar(f"policy_{i}/entropy_loss", aggregate_stats.entropy_loss, update_idx)
+                writer.add_scalar(f"policy_{i}/returns_mean", aggregate_stats.returns_mean, update_idx)
+                writer.add_scalar(f"policy_{i}/returns_stddev", aggregate_stats.returns_stddev, update_idx)
+                
+                # Log best policy's stats
+                if i == best_idx:
+                    writer.add_scalar("best_policy/loss", aggregate_stats.loss, update_idx)
+                    writer.add_scalar("best_policy/action_loss", aggregate_stats.action_loss, update_idx)
+                    writer.add_scalar("best_policy/value_loss", aggregate_stats.value_loss, update_idx)
+                    writer.add_scalar("best_policy/entropy_loss", aggregate_stats.entropy_loss, update_idx)
+                    writer.add_scalar("best_policy/returns_mean", aggregate_stats.returns_mean, update_idx)
+                    writer.add_scalar("best_policy/returns_stddev", aggregate_stats.returns_stddev, update_idx)
 
     # Return the best policy's results for logging
-    best_rollouts = all_rollouts[best_idx]
-    best_advantages = all_advantages[best_idx]
     return UpdateResult(
         actions = best_rollouts.actions.view(-1, *best_rollouts.actions.shape[2:]),
         rewards = best_rollouts.rewards.view(-1, *best_rollouts.rewards.shape[2:]),
         values = best_rollouts.values.view(-1, *best_rollouts.values.shape[2:]),
         advantages = best_advantages.view(-1, *best_advantages.shape[2:]),
-        bootstrap_values = best_rollouts.bootstrap_values,
+        bootstrap_values = best_rollouts.bootstrap_values.view(-1, *best_rollouts.bootstrap_values.shape[2:]),
         ppo_stats = aggregate_stats,
     )
 
@@ -380,7 +421,8 @@ def _update_loop(update_iter_fn : Callable,
                  sim : SimInterface,
                  rollout_mgr : RolloutManager,
                  parallel_state : ParallelPolicyState,
-                 start_update_idx : int):
+                 start_update_idx : int,
+                 writer : Optional[SummaryWriter] = None):
     num_train_seqs = num_agents * cfg.num_bptt_chunks
     assert(num_train_seqs % cfg.ppo.num_mini_batches == 0)
 
@@ -400,9 +442,9 @@ def _update_loop(update_iter_fn : Callable,
                 torch.zeros_like(rollout_mgr.rewards),
                 parallel_state,
                 None,
+                update_idx,
+                writer,
             )
-
-            gpu_sync_fn()
 
         profile.gpu_measure()
         profile.commit()
@@ -479,23 +521,14 @@ def train(dev, sim, cfg, actor_critic, update_cb, restore_ckpt=None, num_paralle
         rollout_mgr=rollout_mgr,
         parallel_state=parallel_state,
         start_update_idx=start_update_idx,
+        writer=None,
     )
 
     # Return best policy
     return parallel_state.policies[parallel_state.best_policy_idx].cpu()
 
 def train_parallel(dev, sim, cfg, actor_critic, update_cb, restore_ckpt=None, num_parallel_policies=4):
-    """Train multiple policies in parallel and select the best one at each step.
-    
-    Args:
-        dev: Device to train on
-        sim: Simulation interface
-        cfg: Training configuration
-        actor_critic: Base policy to clone for parallel training
-        update_cb: Callback function for updates
-        restore_ckpt: Optional checkpoint to restore from
-        num_parallel_policies: Number of policies to train in parallel
-    """
+    """Train multiple policies in parallel and select the best one at each step."""
     print(f"Starting parallel training with {num_parallel_policies} policies")
     print(cfg)
 
@@ -513,17 +546,16 @@ def train_parallel(dev, sim, cfg, actor_critic, update_cb, restore_ckpt=None, nu
     rollout_managers = []
     
     # Default hyperparameters
-    default_lr = 1e-4
-    default_gamma = 0.998
-    default_entropy = 0.01
-    default_value = 0.5
+    default_lr = cfg.lr
+    default_gamma = cfg.gamma
+    default_entropy = cfg.ppo.entropy_coef
+    default_value = cfg.ppo.value_loss_coef
     
     # Initialize amp before creating rollout managers
     amp = AMPState(dev, cfg.mixed_precision)
     
     for i in range(num_parallel_policies):
         # Generate random hyperparameters using log-normal distribution
-        # Scale factor of 0.5 means most values will be within 50% of the default
         scale = 0.5
         
         # Generate random values in log space
@@ -531,6 +563,12 @@ def train_parallel(dev, sim, cfg, actor_critic, update_cb, restore_ckpt=None, nu
         policy_gamma = default_gamma * math.exp(torch.randn(1).item() * scale)
         policy_entropy = default_entropy * math.exp(torch.randn(1).item() * scale)
         policy_value = default_value * math.exp(torch.randn(1).item() * scale)
+
+        if num_parallel_policies >= 1:
+            policy_lr = cfg.lr
+            policy_gamma = cfg.gamma
+            policy_entropy = cfg.ppo.entropy_coef
+            policy_value = cfg.ppo.value_loss_coef
         
         # Clamp gamma to valid range
         policy_gamma = max(0.9, min(0.999, policy_gamma))
@@ -554,12 +592,6 @@ def train_parallel(dev, sim, cfg, actor_critic, update_cb, restore_ckpt=None, nu
             'value_loss_coef': policy_value,
             'worlds_per_policy': worlds_per_policy
         }
-        
-        # print(f"Policy {i} hyperparameters:")
-        # print(f"  Learning rate: {policy_lr:.2e}")
-        # print(f"  Gamma: {policy_gamma:.3f}")
-        # print(f"  Entropy coefficient: {policy_entropy:.3f}")
-        # print(f"  Value loss coefficient: {policy_value:.3f}")
         
         policies.append(policy)
         optimizers.append(optimizer)
@@ -588,119 +620,8 @@ def train_parallel(dev, sim, cfg, actor_critic, update_cb, restore_ckpt=None, nu
         def gpu_sync_fn():
             pass
 
-    def parallel_update_iter(cfg, amp, num_train_seqs, sim, rollout_mgr, advantages, parallel_state, scheduler):
-        with torch.no_grad():
-            # Evaluate all policies in parallel
-            all_rollouts = []
-            all_advantages = []
-            
-            for policy, value_normalizer, rollout_mgr in zip(
-                parallel_state.policies, 
-                parallel_state.value_normalizers,
-                parallel_state.rollout_managers
-            ):
-                policy.eval()
-                value_normalizer.eval()
-                
-                # Reset simulation for each policy evaluation
-                sim.step()  # This triggers a reset in the simulation
-                
-                with profile('Collect Rollouts'):
-                    # Use policy-specific number of worlds
-                    worlds_per_policy = policy.hyperparams['worlds_per_policy']
-                    policy_rollouts = rollout_mgr.collect(amp, sim, policy, value_normalizer)
-                    all_rollouts.append(policy_rollouts)
-                    
-                with profile('Compute Advantages'):
-                    policy_advantages = torch.zeros_like(policy_rollouts.rewards)
-                    _compute_advantages(cfg, amp, value_normalizer, policy_advantages, policy_rollouts)
-                    all_advantages.append(policy_advantages)
-            
-            # Select best policy based on returns
-            returns = [rollouts.rewards.sum().item() for rollouts in all_rollouts]
-            best_idx = max(range(len(returns)), key=lambda i: returns[i])
-            parallel_state.best_policy_idx = best_idx
-            parallel_state.policy_returns = returns
-        
-        # Train each policy using its own rollouts
-        for i, (policy, optimizer, value_normalizer) in enumerate(zip(
-            parallel_state.policies, 
-            parallel_state.optimizers,
-            parallel_state.value_normalizers
-        )):
-            policy.train()
-            value_normalizer.train()
-
-            with profile('PPO'):
-                aggregate_stats = PPOStats()
-                num_stats = 0
-
-                # Create policy-specific config
-                policy_cfg = TrainConfig(
-                    num_updates=cfg.num_updates,
-                    steps_per_update=cfg.steps_per_update,
-                    num_bptt_chunks=cfg.num_bptt_chunks,
-                    lr=policy.hyperparams['lr'],
-                    gamma=policy.hyperparams['gamma'],
-                    gae_lambda=cfg.gae_lambda,
-                    ppo=PPOConfig(
-                        num_mini_batches=cfg.ppo.num_mini_batches,
-                        clip_coef=cfg.ppo.clip_coef,
-                        value_loss_coef=policy.hyperparams['value_loss_coef'],
-                        entropy_coef=policy.hyperparams['entropy_coef'],
-                        max_grad_norm=cfg.ppo.max_grad_norm,
-                        num_epochs=cfg.ppo.num_epochs,
-                        clip_value_loss=cfg.ppo.clip_value_loss,
-                    ),
-                    value_normalizer_decay=cfg.value_normalizer_decay,
-                    mixed_precision=cfg.mixed_precision,
-                )
-
-                # Use this policy's own rollouts and advantages
-                policy_rollouts = all_rollouts[i]
-                policy_advantages = all_advantages[i]
-
-                # Train for specified number of epochs
-                for epoch in range(cfg.ppo.num_epochs):
-                    for inds in torch.randperm(num_train_seqs).chunk(
-                            cfg.ppo.num_mini_batches):
-                        with torch.no_grad(), profile('Gather Minibatch', gpu=True):
-                            mb = _gather_minibatch(policy_rollouts, policy_advantages, inds, amp)
-                        cur_stats = _ppo_update(policy_cfg,
-                                                amp,
-                                                mb,
-                                                policy,
-                                                optimizer,
-                                                value_normalizer)
-
-                        with torch.no_grad():
-                            num_stats += 1
-                            aggregate_stats.loss += (cur_stats.loss - aggregate_stats.loss) / num_stats
-                            aggregate_stats.action_loss += (
-                                cur_stats.action_loss - aggregate_stats.action_loss) / num_stats
-                            aggregate_stats.value_loss += (
-                                cur_stats.value_loss - aggregate_stats.value_loss) / num_stats
-                            aggregate_stats.entropy_loss += (
-                                cur_stats.entropy_loss - aggregate_stats.entropy_loss) / num_stats
-                            aggregate_stats.returns_mean += (
-                                cur_stats.returns_mean - aggregate_stats.returns_mean) / num_stats
-                            aggregate_stats.returns_stddev += (
-                                cur_stats.returns_stddev - aggregate_stats.returns_stddev) / num_stats
-
-        # Return the best policy's results for logging
-        best_rollouts = all_rollouts[best_idx]
-        best_advantages = all_advantages[best_idx]
-        return UpdateResult(
-            actions = best_rollouts.actions.view(-1, *best_rollouts.actions.shape[2:]),
-            rewards = best_rollouts.rewards.view(-1, *best_rollouts.rewards.shape[2:]),
-            values = best_rollouts.values.view(-1, *best_rollouts.values.shape[2:]),
-            advantages = best_advantages.view(-1, *best_advantages.shape[2:]),
-            bootstrap_values = best_rollouts.bootstrap_values,
-            ppo_stats = aggregate_stats,
-        )
-
-    def update_iter_wrapper(cfg, amp, num_train_seqs, sim, rollout_mgr, advantages, parallel_state, scheduler):
-        return parallel_update_iter(cfg, amp, num_train_seqs, sim, rollout_mgr, advantages, parallel_state, scheduler)
+    def update_iter_wrapper(cfg, amp, num_train_seqs, sim, rollout_mgr, advantages, parallel_state, scheduler, update_idx, writer):
+        return _update_iter(cfg, amp, num_train_seqs, sim, rollout_mgr, advantages, parallel_state, scheduler, update_idx, writer)
 
     _update_loop(
         update_iter_fn=update_iter_wrapper,
@@ -712,7 +633,8 @@ def train_parallel(dev, sim, cfg, actor_critic, update_cb, restore_ckpt=None, nu
         rollout_mgr=rollout_managers[0],  # Use first rollout manager as default
         parallel_state=parallel_state,
         start_update_idx=start_update_idx,
+        writer=None,
     )
 
     # Return best policy
-    return parallel_state.policies[parallel_state.best_policy_idx].cpu()
+    return parallel_state.policies[parallel_state.best_policy_idx]
