@@ -139,6 +139,8 @@ def _compute_advantages(
 
     next_advantage = 0.0
     next_values = rollouts.bootstrap_values
+
+    # Compute advantages with GAE
     for i in reversed(range(cfg.steps_per_update)):
         cur_dones = seq_dones[i].to(dtype=amp.compute_dtype)
         cur_rewards = seq_rewards[i].to(dtype=amp.compute_dtype)
@@ -159,6 +161,13 @@ def _compute_advantages(
 
         next_advantage = cur_advantage
         next_values = cur_values
+
+    # Normalize advantages
+    if cfg.normalize_advantages:
+        with torch.no_grad():
+            advantages_mean = advantages_out.mean()
+            advantages_std = advantages_out.std().clamp(min=1e-8)
+            advantages_out.sub_(advantages_mean).div_(advantages_std)
 
 
 def _compute_action_scores(cfg, amp, advantages):
@@ -217,16 +226,26 @@ def _ppo_update(
         value_loss = torch.mean(value_loss)
         entropies = torch.mean(entropies)
 
+        # Adaptive entropy coefficient
+        if cfg.ppo.adaptive_entropy:
+            target_entropy = -0.5  # Target entropy for continuous action spaces
+            entropy_coef = cfg.ppo.entropy_coef * torch.exp(
+                (entropies - target_entropy).detach()
+            )
+        else:
+            entropy_coef = cfg.ppo.entropy_coef
+
         loss = (
             -action_obj
             + cfg.ppo.value_loss_coef * value_loss
-            - cfg.ppo.entropy_coef * entropies
+            - entropy_coef * entropies
         )
 
     # Optimized backward pass
     with profile("Optimize"):
         if amp.scaler is None:
             loss.backward()
+            # Gradient clipping
             nn.utils.clip_grad_norm_(actor_critic.parameters(), cfg.ppo.max_grad_norm)
             optimizer.step()
         else:
@@ -691,11 +710,18 @@ def train_parallel(
                     param, gain=math.exp(torch.randn(1).item() * 0.5)
                 )
 
+        # Create optimizer with learning rate warmup
         optimizer = optim.Adam(policy.parameters(), lr=policy_lrs[i].item(), eps=1e-5)
 
-        # Add learning rate scheduler
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="max", factor=0.5, patience=10
+        # Add learning rate scheduler with warmup
+        scheduler = optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=policy_lrs[i].item(),
+            total_steps=cfg.num_updates,
+            pct_start=0.1,  # 10% warmup
+            anneal_strategy="cos",
+            div_factor=25.0,  # Initial lr = max_lr/25
+            final_div_factor=10000.0,  # Final lr = max_lr/10000
         )
 
         value_normalizer = EMANormalizer(
@@ -724,13 +750,6 @@ def train_parallel(
 
         # Make hyperparams a property of the policy class
         policy._hyperparams = policy.hyperparams
-
-        # Print hyperparameters for this policy
-        print(f"\nPolicy {i} Hyperparameters:")
-        print(f"    LR: {policy._hyperparams['lr']:.2e}")
-        print(f"    Gamma: {policy._hyperparams['gamma']:.4f}")
-        print(f"    Entropy: {policy._hyperparams['entropy_coef']:.2e}")
-        print(f"    Value Loss: {policy._hyperparams['value_loss_coef']:.2e}")
 
         # Store hyperparameters in the policy's state dict
         policy.register_buffer(
