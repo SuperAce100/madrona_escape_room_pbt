@@ -6,7 +6,12 @@ from pathlib import Path
 import json
 
 from madrona_escape_room_learn import (
-    train, train_parallel, profile, TrainConfig, PPOConfig, SimInterface,
+    train,
+    train_parallel,
+    profile,
+    TrainConfig,
+    PPOConfig,
+    SimInterface,
 )
 
 from policy import make_policy, setup_obs
@@ -16,6 +21,7 @@ import math
 from pathlib import Path
 
 # torch.manual_seed(0)
+
 
 class LearningCallback:
     def __init__(self, ckpt_dir, profile_report, writer=None):
@@ -29,7 +35,7 @@ class LearningCallback:
         fps = args.num_worlds * args.steps_per_update / update_time
         self.mean_fps += (fps - self.mean_fps) / update_id
 
-        if update_id != 1 and  update_id % 10 != 0:
+        if update_id != 1 and update_id % 10 != 0:
             return
 
         ppo = update_results.ppo_stats
@@ -52,88 +58,142 @@ class LearningCallback:
             bootstrap_value_max = update_results.bootstrap_values.max().cpu().item()
 
             # Handle both single and parallel training states
-            if hasattr(learning_state, 'value_normalizer'):
+            if hasattr(learning_state, "value_normalizer"):
                 vnorm_mu = learning_state.value_normalizer.mu.cpu().item()
                 vnorm_sigma = learning_state.value_normalizer.sigma.cpu().item()
             else:
                 # For parallel training, use the best policy's normalizer
                 best_idx = learning_state.best_policy_idx
                 vnorm_mu = learning_state.value_normalizers[best_idx].mu.cpu().item()
-                vnorm_sigma = learning_state.value_normalizers[best_idx].sigma.cpu().item()
+                vnorm_sigma = (
+                    learning_state.value_normalizers[best_idx].sigma.cpu().item()
+                )
 
         # Log to TensorBoard if writer is available
         if self.writer is not None:
             # Log PPO stats
-            self.writer.add_scalar('ppo/loss', ppo.loss, update_id)
-            self.writer.add_scalar('ppo/action_loss', ppo.action_loss, update_id)
-            self.writer.add_scalar('ppo/value_loss', ppo.value_loss, update_id)
-            self.writer.add_scalar('ppo/entropy_loss', ppo.entropy_loss, update_id)
-            
+            self.writer.add_scalar("ppo/loss", ppo.loss, update_id)
+            self.writer.add_scalar("ppo/action_loss", ppo.action_loss, update_id)
+            self.writer.add_scalar("ppo/value_loss", ppo.value_loss, update_id)
+            self.writer.add_scalar("ppo/entropy_loss", ppo.entropy_loss, update_id)
+
             # Log rewards
-            self.writer.add_scalar('rewards/mean', reward_mean, update_id)
-            self.writer.add_scalar('rewards/min', reward_min, update_id)
-            self.writer.add_scalar('rewards/max', reward_max, update_id)
-            
+            self.writer.add_scalar("rewards/mean", reward_mean, update_id)
+            self.writer.add_scalar("rewards/min", reward_min, update_id)
+            self.writer.add_scalar("rewards/max", reward_max, update_id)
+
             # Log values
-            self.writer.add_scalar('values/mean', value_mean, update_id)
-            self.writer.add_scalar('values/min', value_min, update_id)
-            self.writer.add_scalar('values/max', value_max, update_id)
-            
+            self.writer.add_scalar("values/mean", value_mean, update_id)
+            self.writer.add_scalar("values/min", value_min, update_id)
+            self.writer.add_scalar("values/max", value_max, update_id)
+
             # Log advantages
-            self.writer.add_scalar('advantages/mean', advantage_mean, update_id)
-            self.writer.add_scalar('advantages/min', advantage_min, update_id)
-            self.writer.add_scalar('advantages/max', advantage_max, update_id)
-            
+            self.writer.add_scalar("advantages/mean", advantage_mean, update_id)
+            self.writer.add_scalar("advantages/min", advantage_min, update_id)
+            self.writer.add_scalar("advantages/max", advantage_max, update_id)
+
             # Log bootstrap values
-            self.writer.add_scalar('bootstrap_values/mean', bootstrap_value_mean, update_id)
-            self.writer.add_scalar('bootstrap_values/min', bootstrap_value_min, update_id)
-            self.writer.add_scalar('bootstrap_values/max', bootstrap_value_max, update_id)
-            
+            self.writer.add_scalar(
+                "bootstrap_values/mean", bootstrap_value_mean, update_id
+            )
+            self.writer.add_scalar(
+                "bootstrap_values/min", bootstrap_value_min, update_id
+            )
+            self.writer.add_scalar(
+                "bootstrap_values/max", bootstrap_value_max, update_id
+            )
+
             # Log returns
-            self.writer.add_scalar('returns/mean', ppo.returns_mean, update_id)
-            self.writer.add_scalar('returns/stddev', ppo.returns_stddev, update_id)
-            
+            self.writer.add_scalar("returns/mean", ppo.returns_mean, update_id)
+            self.writer.add_scalar("returns/stddev", ppo.returns_stddev, update_id)
+
             # Log value normalizer stats
-            self.writer.add_scalar('value_normalizer/mean', vnorm_mu, update_id)
-            self.writer.add_scalar('value_normalizer/stddev', vnorm_sigma, update_id)
-            
+            self.writer.add_scalar("value_normalizer/mean", vnorm_mu, update_id)
+            self.writer.add_scalar("value_normalizer/stddev", vnorm_sigma, update_id)
+
             # Log performance metrics
-            self.writer.add_scalar('performance/fps', fps, update_id)
-            self.writer.add_scalar('performance/mean_fps', self.mean_fps, update_id)
-            self.writer.add_scalar('performance/update_time', update_time, update_id)
-            
+            self.writer.add_scalar("performance/fps", fps, update_id)
+            self.writer.add_scalar("performance/mean_fps", self.mean_fps, update_id)
+            self.writer.add_scalar("performance/update_time", update_time, update_id)
+
             if torch.cuda.is_available():
-                self.writer.add_scalar('memory/reserved_gb', torch.cuda.memory_reserved() / 1024 / 1024 / 1024, update_id)
-                self.writer.add_scalar('memory/allocated_gb', torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024, update_id)
+                self.writer.add_scalar(
+                    "memory/reserved_gb",
+                    torch.cuda.memory_reserved() / 1024 / 1024 / 1024,
+                    update_id,
+                )
+                self.writer.add_scalar(
+                    "memory/allocated_gb",
+                    torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024,
+                    update_id,
+                )
 
             # Log parallel training specific metrics
-            if hasattr(learning_state, 'policy_returns'):
-                # self.writer.add_scalar('parallel/best_policy_idx', learning_state.best_policy_idx, update_id)
-                self.writer.add_scalar('best/best_policy_return', learning_state.policy_returns[learning_state.best_policy_idx], update_id)
-                self.writer.add_scalar('best/best_policy_loss', learning_state.best_policy_stats[-1].loss, update_id)
-                self.writer.add_scalar('best/best_policy_action_loss', learning_state.best_policy_stats[-1].action_loss, update_id)
-                self.writer.add_scalar('best/best_policy_value_loss', learning_state.best_policy_stats[-1].value_loss, update_id)
-                self.writer.add_scalar('best/best_policy_entropy_loss', learning_state.best_policy_stats[-1].entropy_loss, update_id)
-                self.writer.add_scalar('best/best_policy_returns_mean', learning_state.best_policy_stats[-1].returns_mean, update_id)
-                self.writer.add_scalar('best/best_policy_returns_stddev', learning_state.best_policy_stats[-1].returns_stddev, update_id)
-
-                # all_policies_returns = learning_state.policy_returns
-                # self.writer.add_scalars('parallel/all_policies_returns', {f'policy_{i}': ret for i, ret in enumerate(all_policies_returns)}, update_id)
+            if hasattr(learning_state, "policy_returns"):
+                self.writer.add_scalar(
+                    "best/best_policy_return",
+                    learning_state.policy_returns[learning_state.best_policy_idx],
+                    update_id,
+                )
+                self.writer.add_scalar(
+                    "best/best_policy_loss",
+                    learning_state.best_policy_stats[-1].loss,
+                    update_id,
+                )
+                self.writer.add_scalar(
+                    "best/best_policy_action_loss",
+                    learning_state.best_policy_stats[-1].action_loss,
+                    update_id,
+                )
+                self.writer.add_scalar(
+                    "best/best_policy_value_loss",
+                    learning_state.best_policy_stats[-1].value_loss,
+                    update_id,
+                )
+                self.writer.add_scalar(
+                    "best/best_policy_entropy_loss",
+                    learning_state.best_policy_stats[-1].entropy_loss,
+                    update_id,
+                )
+                self.writer.add_scalar(
+                    "best/best_policy_returns_mean",
+                    learning_state.best_policy_stats[-1].returns_mean,
+                    update_id,
+                )
+                self.writer.add_scalar(
+                    "best/best_policy_returns_stddev",
+                    learning_state.best_policy_stats[-1].returns_stddev,
+                    update_id,
+                )
 
         print(f"\nUpdate: {update_id}")
-        print(f"    Loss: {ppo.loss: .3e}, A: {ppo.action_loss: .3e}, V: {ppo.value_loss: .3e}, E: {ppo.entropy_loss: .3e}")
+        print(
+            f"    Loss: {ppo.loss: .3e}, A: {ppo.action_loss: .3e}, V: {ppo.value_loss: .3e}, E: {ppo.entropy_loss: .3e}"
+        )
         print()
-        print(f"    Rewards          => Avg: {reward_mean: .3e}, Min: {reward_min: .3e}, Max: {reward_max: .3e}")
-        print(f"    Values           => Avg: {value_mean: .3e}, Min: {value_min: .3e}, Max: {value_max: .3e}")
-        print(f"    Advantages       => Avg: {advantage_mean: .3e}, Min: {advantage_min: .3e}, Max: {advantage_max: .3e}")
-        print(f"    Bootstrap Values => Avg: {bootstrap_value_mean: .3e}, Min: {bootstrap_value_min: .3e}, Max: {bootstrap_value_max: .3e}")
-        print(f"    Returns          => Avg: {ppo.returns_mean}, σ: {ppo.returns_stddev}")
-        print(f"    Value Normalizer => Mean: {vnorm_mu: .3e}, σ: {vnorm_sigma :.3e}")
+        print(
+            f"    Rewards          => Avg: {reward_mean: .3e}, Min: {reward_min: .3e}, Max: {reward_max: .3e}"
+        )
+        print(
+            f"    Values           => Avg: {value_mean: .3e}, Min: {value_min: .3e}, Max: {value_max: .3e}"
+        )
+        print(
+            f"    Advantages       => Avg: {advantage_mean: .3e}, Min: {advantage_min: .3e}, Max: {advantage_max: .3e}"
+        )
+        print(
+            f"    Bootstrap Values => Avg: {bootstrap_value_mean: .3e}, Min: {bootstrap_value_min: .3e}, Max: {bootstrap_value_max: .3e}"
+        )
+        print(
+            f"    Returns          => Avg: {ppo.returns_mean}, σ: {ppo.returns_stddev}"
+        )
+        print(f"    Value Normalizer => Mean: {vnorm_mu: .3e}, σ: {vnorm_sigma:.3e}")
 
-        if hasattr(learning_state, 'policy_returns'):
-            print(f"    Policy Returns   => {[f'{r:.3e}' for r in learning_state.policy_returns]}")
-            print(f"    Best Policy      => {learning_state.best_policy_idx}")
-            
+        if hasattr(learning_state, "policy_returns"):
+            print(f"\n    Policy Returns:")
+            for i, ret in enumerate(learning_state.policy_returns):
+                print(f"        Policy {i}: {ret:.3e}")
+            print(f"    Best Policy: {learning_state.best_policy_idx}")
+
             # Print best policy's stats
             if learning_state.best_policy_stats:
                 best_stats = learning_state.best_policy_stats[-1]
@@ -144,22 +204,34 @@ class LearningCallback:
                 print(f"        Entropy Loss: {best_stats.entropy_loss: .3e}")
                 print(f"        Returns Mean: {best_stats.returns_mean: .3e}")
                 print(f"        Returns StdDev: {best_stats.returns_stddev: .3e}")
-            
+
             print("\n    Policy Hyperparameters:")
             for i, policy in enumerate(learning_state.policies):
-                print(f"      Policy {i}:")
-                print(f"        LR: {policy.hyperparams['lr']:.2e}")
-                print(f"        Entropy: {policy.hyperparams['entropy_coef']:.2e}")
-                print(f"        Value Loss: {policy.hyperparams['value_loss_coef']:.2e}")
+                print(f"        Policy {i}:")
+                # Access hyperparameters from the policy's state dict
+                hyperparams = {
+                    "lr": policy._hyperparams_tensor[0].item(),
+                    "gamma": policy._hyperparams_tensor[1].item(),
+                    "entropy_coef": policy._hyperparams_tensor[2].item(),
+                    "value_loss_coef": policy._hyperparams_tensor[3].item(),
+                }
+                print(f"            LR: {hyperparams['lr']:.2e}")
+                print(f"            Gamma: {hyperparams['gamma']:.4f}")
+                print(f"            Entropy: {hyperparams['entropy_coef']:.2e}")
+                print(f"            Value Loss: {hyperparams['value_loss_coef']:.2e}")
 
         if self.profile_report:
             print()
-            print(f"    FPS: {fps:.0f}, Update Time: {update_time:.2f}, Avg FPS: {self.mean_fps:.0f}")
-            print(f"    PyTorch Memory Usage: {torch.cuda.memory_reserved() / 1024 / 1024 / 1024:.3f}GB (Reserved), {torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024:.3f}GB (Current)")
+            print(
+                f"    FPS: {fps:.0f}, Update Time: {update_time:.2f}, Avg FPS: {self.mean_fps:.0f}"
+            )
+            print(
+                f"    PyTorch Memory Usage: {torch.cuda.memory_reserved() / 1024 / 1024 / 1024:.3f}GB (Reserved), {torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024:.3f}GB (Current)"
+            )
             profile.report()
 
         if update_id % 100 == 0:
-            if hasattr(learning_state, 'save'):
+            if hasattr(learning_state, "save"):
                 learning_state.save(update_idx, self.ckpt_dir / f"{update_id}.pth")
             else:
                 # For parallel training, save the best policy
@@ -168,47 +240,59 @@ class LearningCallback:
 
 
 arg_parser = argparse.ArgumentParser()
-arg_parser.add_argument('--gpu-id', type=int, default=0)
-arg_parser.add_argument('--ckpt-dir', type=str, required=True)
-arg_parser.add_argument('--restore', type=int)
+arg_parser.add_argument("--gpu-id", type=int, default=0)
+arg_parser.add_argument("--ckpt-dir", type=str, required=True)
+arg_parser.add_argument("--restore", type=int)
 
-arg_parser.add_argument('--num-worlds', type=int, required=True)
-arg_parser.add_argument('--num-updates', type=int, required=True)
-arg_parser.add_argument('--steps-per-update', type=int, default=40)
-arg_parser.add_argument('--num-bptt-chunks', type=int, default=8)
+arg_parser.add_argument("--num-worlds", type=int, required=True)
+arg_parser.add_argument("--num-updates", type=int, required=True)
+arg_parser.add_argument("--steps-per-update", type=int, default=40)
+arg_parser.add_argument("--num-bptt-chunks", type=int, default=8)
 
-arg_parser.add_argument('--lr', type=float, default=1e-4)
-arg_parser.add_argument('--gamma', type=float, default=0.998)
-arg_parser.add_argument('--entropy-loss-coef', type=float, default=0.01)
-arg_parser.add_argument('--value-loss-coef', type=float, default=0.5)
-arg_parser.add_argument('--clip-value-loss', action='store_true')
+arg_parser.add_argument("--lr", type=float, default=1e-4)
+arg_parser.add_argument("--gamma", type=float, default=0.998)
+arg_parser.add_argument("--entropy-loss-coef", type=float, default=0.01)
+arg_parser.add_argument("--value-loss-coef", type=float, default=0.5)
+arg_parser.add_argument("--clip-value-loss", action="store_true")
 
-arg_parser.add_argument('--num-channels', type=int, default=256)
-arg_parser.add_argument('--separate-value', action='store_true')
-arg_parser.add_argument('--fp16', action='store_true')
+arg_parser.add_argument("--num-channels", type=int, default=256)
+arg_parser.add_argument("--separate-value", action="store_true")
+arg_parser.add_argument("--fp16", action="store_true")
 
-arg_parser.add_argument('--gpu-sim', action='store_true')
-arg_parser.add_argument('--profile-report', action='store_true')
-arg_parser.add_argument('--parallel-training', action='store_true', help='Enable parallel policy training')
-arg_parser.add_argument('--num-parallel-policies', type=int, default=4, help='Number of policies to train in parallel')
+arg_parser.add_argument("--gpu-sim", action="store_true")
+arg_parser.add_argument("--profile-report", action="store_true")
+arg_parser.add_argument(
+    "--parallel-training", action="store_true", help="Enable parallel policy training"
+)
+arg_parser.add_argument(
+    "--num-parallel-policies",
+    type=int,
+    default=4,
+    help="Number of policies to train in parallel",
+)
 
 if __name__ == "__main__":
     args = arg_parser.parse_args()
 
     # Setup TensorBoard logging
-    log_dir = Path("runs") / f"{datetime.now().strftime("%Y%m%d-%H%M%S")}_npol{args.num_parallel_policies}_worlds{args.num_worlds}"
+    log_dir = (
+        Path("runs")
+        / f"{datetime.now().strftime('%Y%m%d-%H%M%S')}_npol{args.num_parallel_policies}_worlds{args.num_worlds}"
+    )
     writer = SummaryWriter(log_dir=str(log_dir))
-    
+
     # Log training configuration
     config_dict = vars(args)
     writer.add_text("config", json.dumps(config_dict, indent=2))
 
     sim = madrona_escape_room.SimManager(
-        exec_mode = madrona_escape_room.madrona.ExecMode.CUDA if args.gpu_sim else madrona_escape_room.madrona.ExecMode.CPU,
-        gpu_id = args.gpu_id,
-        num_worlds = args.num_worlds // args.num_parallel_policies,
-        rand_seed = 5,
-        auto_reset = True,
+        exec_mode=madrona_escape_room.madrona.ExecMode.CUDA
+        if args.gpu_sim
+        else madrona_escape_room.madrona.ExecMode.CPU,
+        gpu_id=args.gpu_id,
+        num_worlds=args.num_worlds // args.num_parallel_policies,
+        rand_seed=5,
+        auto_reset=True,
     )
 
     ckpt_dir = Path(args.ckpt_dir)
@@ -216,9 +300,9 @@ if __name__ == "__main__":
     learning_cb = LearningCallback(ckpt_dir, args.profile_report, writer)
 
     if torch.cuda.is_available():
-        dev = torch.device(f'cuda:{args.gpu_id}')
+        dev = torch.device(f"cuda:{args.gpu_id}")
     else:
-        dev = torch.device('cpu')
+        dev = torch.device("cpu")
 
     ckpt_dir.mkdir(exist_ok=True, parents=True)
 
@@ -231,7 +315,7 @@ if __name__ == "__main__":
 
     # Flatten N, A, ... tensors to N * A, ...
     actions = actions.view(-1, *actions.shape[2:])
-    dones  = dones.view(-1, *dones.shape[2:])
+    dones = dones.view(-1, *dones.shape[2:])
     rewards = rewards.view(-1, *rewards.shape[2:])
 
     if args.restore:
@@ -240,13 +324,13 @@ if __name__ == "__main__":
         restore_ckpt = None
 
     train_config = TrainConfig(
-        num_updates = args.num_updates,
-        steps_per_update = args.steps_per_update,
-        num_bptt_chunks = args.num_bptt_chunks,
-        lr = args.lr,
-        gamma = args.gamma,
-        gae_lambda = 0.95,
-        ppo = PPOConfig(
+        num_updates=args.num_updates,
+        steps_per_update=args.steps_per_update,
+        num_bptt_chunks=args.num_bptt_chunks,
+        lr=args.lr,
+        gamma=args.gamma,
+        gae_lambda=0.95,
+        ppo=PPOConfig(
             num_mini_batches=1,
             clip_coef=0.2,
             value_loss_coef=args.value_loss_coef,
@@ -255,21 +339,23 @@ if __name__ == "__main__":
             num_epochs=2,
             clip_value_loss=args.clip_value_loss,
         ),
-        value_normalizer_decay = 0.999,
-        mixed_precision = args.fp16,
+        value_normalizer_decay=0.999,
+        mixed_precision=args.fp16,
     )
 
     sim_interface = SimInterface(
-        step = lambda: sim.step(),
-        obs = obs,
-        actions = actions,
-        dones = dones,
-        rewards = rewards,
+        step=lambda: sim.step(),
+        obs=obs,
+        actions=actions,
+        dones=dones,
+        rewards=rewards,
     )
 
     try:
         if args.parallel_training:
-            print(f"Starting parallel training with {args.num_parallel_policies} policies")
+            print(
+                f"Starting parallel training with {args.num_parallel_policies} policies"
+            )
             train_parallel(
                 dev,
                 sim_interface,
@@ -277,7 +363,7 @@ if __name__ == "__main__":
                 policy,
                 learning_cb,
                 restore_ckpt,
-                num_parallel_policies=args.num_parallel_policies
+                num_parallel_policies=args.num_parallel_policies,
             )
         else:
             train_parallel(
@@ -287,7 +373,7 @@ if __name__ == "__main__":
                 policy,
                 learning_cb,
                 restore_ckpt,
-                num_parallel_policies=1
+                num_parallel_policies=1,
             )
     finally:
         writer.close()
