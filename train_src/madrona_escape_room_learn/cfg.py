@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Callable, List
+from typing import Callable, List, Optional
 
 import torch
 
@@ -15,6 +15,14 @@ class PPOConfig:
     adaptive_entropy: bool = True
 
 @dataclass(frozen=True)
+class PBTConfig:
+    population_size: int = 8
+    elite_fraction: float = 0.2  # Top fraction of policies to keep
+    mutation_rate: float = 0.1  # Probability of mutating hyperparameters
+    mutation_scale: float = 0.2  # Scale of hyperparameter mutations
+    eval_interval: int = 100  # How often to evaluate and potentially evolve population
+
+@dataclass(frozen=True)
 class TrainConfig:
     num_updates: int
     steps_per_update: int
@@ -22,6 +30,7 @@ class TrainConfig:
     lr: float
     gamma: float
     ppo: PPOConfig
+    pbt: Optional[PBTConfig] = None  # PBT configuration
     gae_lambda: float = 1.0
     normalize_advantages: bool = True
     normalize_values : bool = True
@@ -36,6 +45,10 @@ class TrainConfig:
                 rep += f"\n  ppo:"
                 for ppo_k, ppo_v in self.ppo.__dict__.items():
                     rep += f"\n    {ppo_k}: {ppo_v}"
+            elif k == 'pbt' and v is not None:
+                rep += f"\n  pbt:"
+                for pbt_k, pbt_v in v.__dict__.items():
+                    rep += f"\n    {pbt_k}: {pbt_v}"
             else:
                 rep += f"\n  {k}: {v}" 
 

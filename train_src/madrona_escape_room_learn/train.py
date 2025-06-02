@@ -11,6 +11,7 @@ from typing import List, Optional, Dict
 from .profile import profile
 from time import time
 from pathlib import Path
+import copy
 
 from .cfg import TrainConfig, SimInterface
 from .rollouts import RolloutManager, Rollouts
@@ -313,7 +314,7 @@ def _update_loop(update_iter_fn : Callable,
     advantages = torch.zeros_like(rollout_mgr.rewards)
 
     for update_idx in range(start_update_idx, cfg.num_updates):
-        update_start_time  = time()
+        update_start_time = time()
 
         with profile("Update Iter Timing"):
             update_result = update_iter_fn(
@@ -346,23 +347,43 @@ def train(dev, sim, cfg, actor_critic, update_cb, restore_ckpt=None):
 
     num_agents = sim.actions.shape[0]
 
-    actor_critic = actor_critic.to(dev)
-
-    optimizer = optim.Adam(actor_critic.parameters(), lr=cfg.lr)
-
-    amp = AMPState(dev, cfg.mixed_precision)
-
-    value_normalizer = EMANormalizer(cfg.value_normalizer_decay,
-                                     disable=not cfg.normalize_values)
-    value_normalizer = value_normalizer.to(dev)
-
-    learning_state = LearningState(
-        policy = actor_critic,
-        optimizer = optimizer,
-        scheduler = None,
-        value_normalizer = value_normalizer,
-        amp = amp,
-    )
+    # Initialize population if using PBT
+    if cfg.pbt:
+        population = []
+        for _ in range(cfg.pbt.population_size):
+            policy = copy.deepcopy(actor_critic).to(dev)
+            optimizer = optim.Adam(policy.parameters(), lr=cfg.lr)
+            amp = AMPState(dev, cfg.mixed_precision)
+            value_normalizer = EMANormalizer(cfg.value_normalizer_decay,
+                                          disable=not cfg.normalize_values)
+            value_normalizer = value_normalizer.to(dev)
+            
+            learning_state = LearningState(
+                policy=policy,
+                optimizer=optimizer,
+                scheduler=None,
+                value_normalizer=value_normalizer,
+                amp=amp,
+            )
+            population.append(learning_state)
+        
+        # Start with first policy
+        learning_state = population[0]
+    else:
+        actor_critic = actor_critic.to(dev)
+        optimizer = optim.Adam(actor_critic.parameters(), lr=cfg.lr)
+        amp = AMPState(dev, cfg.mixed_precision)
+        value_normalizer = EMANormalizer(cfg.value_normalizer_decay,
+                                      disable=not cfg.normalize_values)
+        value_normalizer = value_normalizer.to(dev)
+        
+        learning_state = LearningState(
+            policy=actor_critic,
+            optimizer=optimizer,
+            scheduler=None,
+            value_normalizer=value_normalizer,
+            amp=amp,
+        )
 
     if restore_ckpt != None:
         start_update_idx = learning_state.load(restore_ckpt)
@@ -370,7 +391,7 @@ def train(dev, sim, cfg, actor_critic, update_cb, restore_ckpt=None):
         start_update_idx = 0
 
     rollout_mgr = RolloutManager(dev, sim, cfg.steps_per_update,
-        cfg.num_bptt_chunks, amp, actor_critic.recurrent_cfg)
+        cfg.num_bptt_chunks, amp, learning_state.policy.recurrent_cfg)
 
     if dev.type == 'cuda':
         def gpu_sync_fn():
@@ -391,4 +412,4 @@ def train(dev, sim, cfg, actor_critic, update_cb, restore_ckpt=None):
         start_update_idx=start_update_idx,
     )
 
-    return actor_critic.cpu()
+    return learning_state.policy.cpu()

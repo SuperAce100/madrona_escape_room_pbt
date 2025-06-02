@@ -1,6 +1,6 @@
 from madrona_escape_room_learn.train import train
 from madrona_escape_room_learn.learning_state import LearningState
-from madrona_escape_room_learn.cfg import TrainConfig, PPOConfig, SimInterface
+from madrona_escape_room_learn.cfg import TrainConfig, PPOConfig, SimInterface, PBTConfig
 from madrona_escape_room_learn.action import DiscreteActionDistributions
 from madrona_escape_room_learn.actor_critic import (
         ActorCritic, DiscreteActor, Critic,
@@ -18,4 +18,5 @@ __all__ = [
         "ActorCritic", "DiscreteActor", "Critic",
         "BackboneEncoder", "RecurrentBackboneEncoder",
         "Backbone", "BackboneShared", "BackboneSeparate",
+        "PBTConfig",
     ]
