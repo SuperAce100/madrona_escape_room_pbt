@@ -67,6 +67,7 @@ class ParallelPolicyState:
     policy_returns: List[float] = field(default_factory=list)
     best_policy_returns: List[float] = field(default_factory=list)
     best_policy_stats: List[PPOStats] = field(default_factory=list)
+    schedulers: List[torch.optim.lr_scheduler.LRScheduler] = field(default_factory=list)
 
 
 def _mb_slice(tensor, inds):
@@ -124,11 +125,6 @@ def _compute_advantages(
     advantages_out: torch.Tensor,
     rollouts: Rollouts,
 ):
-    # This function is going to be operating in fp16 mode completely
-    # when mixed precision is enabled since amp.compute_dtype is fp16
-    # even though there is no autocast here. Unclear if this is desirable or
-    # even beneficial for performance.
-
     num_chunks, steps_per_chunk, N = rollouts.dones.shape[0:3]
     T = num_chunks * steps_per_chunk
 
@@ -192,60 +188,49 @@ def _ppo_update(
     value_normalizer: EMANormalizer,
 ):
     with amp.enable():
-        # Parallel forward pass for actor and critic
+        # Forward pass for actor and critic
         with profile("AC Forward", gpu=True):
             new_log_probs, entropies, new_values = actor_critic.fwd_update(
                 mb.rnn_start_states, mb.dones, mb.actions, *mb.obs
             )
 
-        # Vectorized advantage computation
+        # Compute PPO loss
         with torch.no_grad():
-            action_scores = _compute_action_scores(cfg, amp, mb.advantages)
             ratio = torch.exp(new_log_probs - mb.log_probs)
-            surr1 = action_scores * ratio
-            surr2 = action_scores * (
-                torch.clamp(ratio, 1.0 - cfg.ppo.clip_coef, 1.0 + cfg.ppo.clip_coef)
+            surr1 = mb.advantages * ratio
+            surr2 = mb.advantages * torch.clamp(
+                ratio, 1.0 - cfg.ppo.clip_coef, 1.0 + cfg.ppo.clip_coef
             )
+            action_obj = torch.min(surr1, surr2)
 
-        # Parallel loss computation
-        action_obj = torch.min(surr1, surr2)
+        # Compute value loss with proper normalization
         returns = mb.advantages + mb.values
+        normalized_returns = value_normalizer(amp, returns)
 
         if cfg.ppo.clip_value_loss:
-            with torch.no_grad():
-                low = mb.values - cfg.ppo.clip_coef
-                high = mb.values + cfg.ppo.clip_coef
-            new_values = torch.clamp(new_values, low, high)
-
-        # Vectorized value normalization and loss
-        normalized_returns = value_normalizer(amp, returns)
-        value_loss = 0.5 * F.mse_loss(new_values, normalized_returns, reduction="none")
-
-        # Parallel reduction operations
-        action_obj = torch.mean(action_obj)
-        value_loss = torch.mean(value_loss)
-        entropies = torch.mean(entropies)
-
-        # Adaptive entropy coefficient
-        if cfg.ppo.adaptive_entropy:
-            target_entropy = -0.5  # Target entropy for continuous action spaces
-            entropy_coef = cfg.ppo.entropy_coef * torch.exp(
-                (entropies - target_entropy).detach()
+            value_pred_clipped = mb.values + (new_values - mb.values).clamp(
+                -cfg.ppo.clip_coef, cfg.ppo.clip_coef
             )
+            value_losses = (new_values - normalized_returns).pow(2)
+            value_losses_clipped = (value_pred_clipped - normalized_returns).pow(2)
+            value_loss = 0.5 * torch.max(value_losses, value_losses_clipped).mean()
         else:
-            entropy_coef = cfg.ppo.entropy_coef
+            value_loss = 0.5 * F.mse_loss(new_values, normalized_returns)
 
+        # Compute entropy loss with proper scaling
+        entropy_loss = -entropies.mean()
+
+        # Total loss with proper weighting
         loss = (
-            -action_obj
+            -action_obj.mean()
             + cfg.ppo.value_loss_coef * value_loss
-            - entropy_coef * entropies
+            + cfg.ppo.entropy_coef * entropy_loss
         )
 
-    # Optimized backward pass
+    # Optimize with gradient clipping
     with profile("Optimize"):
         if amp.scaler is None:
             loss.backward()
-            # Gradient clipping
             nn.utils.clip_grad_norm_(actor_critic.parameters(), cfg.ppo.max_grad_norm)
             optimizer.step()
         else:
@@ -257,16 +242,16 @@ def _ppo_update(
 
         optimizer.zero_grad()
 
-    # Parallel statistics computation
+    # Compute statistics
     with torch.no_grad():
         returns_var, returns_mean = torch.var_mean(normalized_returns)
         returns_stddev = torch.sqrt(returns_var)
 
         stats = PPOStats(
             loss=loss.cpu().float().item(),
-            action_loss=-(action_obj.cpu().float().item()),
+            action_loss=-(action_obj.mean().cpu().float().item()),
             value_loss=value_loss.cpu().float().item(),
-            entropy_loss=-(entropies.cpu().float().item()),
+            entropy_loss=-(entropies.mean().cpu().float().item()),
             returns_mean=returns_mean.cpu().float().item(),
             returns_stddev=returns_stddev.cpu().float().item(),
         )
@@ -291,6 +276,7 @@ def _update_iter(
         all_rollouts = []
         all_advantages = []
         all_returns = []
+        all_max_ys = []  # Track max y positions for each policy
 
         for i, (policy, value_normalizer, rollout_mgr) in enumerate(
             zip(
@@ -334,28 +320,55 @@ def _update_iter(
                 )
                 all_advantages.append(policy_advantages)
 
-            # Calculate returns for this policy
+            # Calculate returns and max y position for this policy
             returns = rollouts.rewards.sum().item()
+            max_y = rollouts.rewards.view(-1, rollouts.rewards.shape[2]).max(dim=0)[0].mean().item()
             all_returns.append(returns)
+            all_max_ys.append(max_y)
 
             # Update learning rate based on returns
             if scheduler is not None:
                 scheduler.step(returns)
 
-        # Select best policy based on returns
-        best_idx = max(range(len(all_returns)), key=lambda i: all_returns[i])
+        # Select best policy based on progress through rooms
+        best_idx = max(range(len(all_max_ys)), key=lambda i: all_max_ys[i])
         parallel_state.best_policy_idx = best_idx
         parallel_state.policy_returns = all_returns
 
-        # Track best policy's returns
+        # Track best policy's returns and progress
         parallel_state.best_policy_returns.append(all_returns[best_idx])
 
-        # Log returns for each policy if writer is provided
+        # Log metrics for each policy if writer is provided
         if writer is not None:
-            for i, ret in enumerate(all_returns):
+            for i, (ret, max_y) in enumerate(zip(all_returns, all_max_ys)):
                 writer.add_scalar(f"policy_{i}/returns", ret, update_idx)
+                writer.add_scalar(f"policy_{i}/max_y", max_y, update_idx)
+                
+                # Log room success rates for each policy
+                room1_success = (max_y >= 13.33).float().mean().item()
+                room2_success = (max_y >= 26.67).float().mean().item()
+                room3_success = (max_y >= 40.0).float().mean().item()
+                
+                writer.add_scalar(f"policy_{i}/room1_success", room1_success, update_idx)
+                writer.add_scalar(f"policy_{i}/room2_success", room2_success, update_idx)
+                writer.add_scalar(f"policy_{i}/room3_success", room3_success, update_idx)
+                
+                # Log progress metrics
+                progress = max_y / 40.0  # Normalized progress
+                writer.add_scalar(f"policy_{i}/progress", progress, update_idx)
+                
+                # Log hyperparameters
+                policy = parallel_state.policies[i]
+                writer.add_scalar(f"policy_{i}/lr", policy.hyperparams["lr"], update_idx)
+                writer.add_scalar(f"policy_{i}/gamma", policy.hyperparams["gamma"], update_idx)
+                writer.add_scalar(f"policy_{i}/entropy_coef", policy.hyperparams["entropy_coef"], update_idx)
+                writer.add_scalar(f"policy_{i}/value_loss_coef", policy.hyperparams["value_loss_coef"], update_idx)
+
+            # Log best policy metrics
             writer.add_scalar("best_policy_idx", best_idx, update_idx)
             writer.add_scalar("best_policy/returns", all_returns[best_idx], update_idx)
+            writer.add_scalar("best_policy/max_y", all_max_ys[best_idx], update_idx)
+            writer.add_scalar("best_policy/progress", all_max_ys[best_idx] / 40.0, update_idx)
 
     # Train each policy using its own rollouts and advantages
     for i, (policy, optimizer, value_normalizer, rollouts, advantages) in enumerate(
@@ -637,10 +650,198 @@ def train(
     return parallel_state.policies[parallel_state.best_policy_idx].cpu()
 
 
-def train_parallel(
-    dev, sim, cfg, actor_critic, update_cb, restore_ckpt=None, num_parallel_policies=4
+def _transfer_policy_weights(target_policy, source_policy, transfer_ratio=0.5):
+    """Transfer weights from source policy to target policy with some mixing."""
+    with torch.no_grad():
+        for target_param, source_param in zip(target_policy.parameters(), source_policy.parameters()):
+            # Mix weights with random mask
+            mask = torch.rand_like(target_param) < transfer_ratio
+            target_param.data = torch.where(mask, source_param.data, target_param.data)
+
+def _tournament_select(policy_performances, tournament_size=3):
+    """Select a policy using tournament selection."""
+    candidates = np.random.choice(len(policy_performances), tournament_size, replace=False)
+    return max(candidates, key=lambda i: policy_performances[i][1])
+
+def _crossover_hyperparams(parent1_params, parent2_params):
+    """Create new hyperparameters by crossing over two parents."""
+    child_params = {}
+    for key in parent1_params:
+        if np.random.random() < 0.5:
+            child_params[key] = parent1_params[key]
+        else:
+            child_params[key] = parent2_params[key]
+    return child_params
+
+def _compute_policy_score(returns_history, value_loss_history, entropy_history, window_size=10):
+    """Compute a policy score based on progress through rooms."""
+    if len(returns_history) < window_size:
+        return np.mean(returns_history)  # Not enough history yet
+    
+    recent_returns = returns_history[-window_size:]
+    recent_value_loss = value_loss_history[-window_size:]
+    recent_entropy = entropy_history[-window_size:]
+    
+    # Compute metrics
+    mean_return = np.mean(recent_returns)
+    return_std = np.std(recent_returns)
+    mean_value_loss = np.mean(recent_value_loss)
+    mean_entropy = np.mean(recent_entropy)
+    
+    # Calculate progress through rooms
+    # Assuming rewards are based on y-position progress
+    progress = mean_return / 40.0  # Normalize by max possible progress
+    progress_std = return_std / 40.0
+    
+    # Higher entropy is good (exploration), but not too high
+    entropy_score = np.clip(mean_entropy, 0, 0.5) / 0.5
+    
+    # Lower value loss is good (better value estimation)
+    value_score = np.exp(-mean_value_loss)
+    
+    # Progress score: higher progress with lower variance is good
+    # Add small constant to denominator to handle early training
+    progress_score = progress / (1 + progress_std + 1e-6)
+    
+    # Combine scores with focus on progress
+    total_score = (
+        0.6 * progress_score +    # Progress through rooms
+        0.2 * value_score +      # Value function quality
+        0.2 * entropy_score      # Exploration
+    )
+    
+    return total_score
+
+def _resample_hyperparameters(
+    parallel_state: ParallelPolicyState,
+    num_parallel_policies: int,
+    default_lr: float,
+    default_gamma: float,
+    default_entropy: float,
+    default_value: float,
+    mutation_rate: float = 0.1,
+    elite_fraction: float = 0.3,
+    transfer_ratio: float = 0.5,
 ):
-    """Train multiple policies in parallel and select the best one at each step."""
+    """Resample hyperparameters based on progress through rooms."""
+    num_elites = max(1, int(num_parallel_policies * elite_fraction))
+    
+    # Compute policy scores
+    policy_scores = []
+    for i in range(len(parallel_state.policies)):
+        score = _compute_policy_score(
+            parallel_state.policy_returns,
+            [stats.value_loss for stats in parallel_state.best_policy_stats],
+            [stats.entropy_loss for stats in parallel_state.best_policy_stats]
+        )
+        policy_scores.append((i, score))
+    
+    # Sort policies by their scores
+    policy_scores.sort(key=lambda x: x[1], reverse=True)
+    
+    # Keep elite policies unchanged
+    elite_indices = [p[0] for p in policy_scores[:num_elites]]
+    
+    # Generate new hyperparameters and transfer weights for non-elite policies
+    new_hyperparams = []
+    for i in range(num_parallel_policies):
+        if i in elite_indices:
+            # Keep elite policy hyperparameters
+            policy = parallel_state.policies[i]
+            new_hyperparams.append({
+                "lr": policy.hyperparams["lr"],
+                "gamma": policy.hyperparams["gamma"],
+                "entropy_coef": policy.hyperparams["entropy_coef"],
+                "value_loss_coef": policy.hyperparams["value_loss_coef"],
+            })
+        else:
+            # Tournament selection for parents
+            parent1_idx = _tournament_select(policy_scores)
+            parent2_idx = _tournament_select(policy_scores)
+            
+            # Crossover hyperparameters
+            parent1 = parallel_state.policies[parent1_idx]
+            parent2 = parallel_state.policies[parent2_idx]
+            child_params = _crossover_hyperparams(parent1.hyperparams, parent2.hyperparams)
+            
+            # Mutate child hyperparameters with focus on exploration early
+            # and exploitation later
+            progress = np.mean(parallel_state.policy_returns[-10:]) / 40.0
+            adaptive_mutation = mutation_rate * (1.0 - progress)  # More mutation early
+            
+            new_params = {
+                "lr": child_params["lr"] * np.exp(np.random.normal(0, adaptive_mutation * 0.5)),
+                "gamma": child_params["gamma"] * np.exp(np.random.normal(0, adaptive_mutation * 0.2)),
+                "entropy_coef": child_params["entropy_coef"] * np.exp(np.random.normal(0, adaptive_mutation * 0.5)),
+                "value_loss_coef": child_params["value_loss_coef"] * np.exp(np.random.normal(0, adaptive_mutation * 0.5)),
+            }
+            
+            # Transfer weights from best parent
+            best_parent_idx = parent1_idx if policy_scores[parent1_idx][1] > policy_scores[parent2_idx][1] else parent2_idx
+            _transfer_policy_weights(parallel_state.policies[i], parallel_state.policies[best_parent_idx], transfer_ratio)
+            
+            new_hyperparams.append(new_params)
+    
+    # Clamp values to reasonable ranges
+    for params in new_hyperparams:
+        params["lr"] = np.clip(params["lr"], 1e-5, 1e-3)
+        params["gamma"] = np.clip(params["gamma"], 0.95, 0.999)
+        params["entropy_coef"] = np.clip(params["entropy_coef"], 0.001, 0.2)
+        params["value_loss_coef"] = np.clip(params["value_loss_coef"], 0.1, 2.0)
+    
+    return new_hyperparams
+
+def _update_hyperparameters(
+    parallel_state: ParallelPolicyState,
+    new_hyperparams: List[Dict],
+    dev: torch.device,
+    cfg: TrainConfig,
+    sim: SimInterface,
+    amp: AMPState,
+):
+    """Update policies with new hyperparameters while preserving their weights."""
+    for i, (policy, params) in enumerate(zip(parallel_state.policies, new_hyperparams)):
+        # Update hyperparameters
+        policy.hyperparams = params
+        policy._hyperparams = params
+        
+        # Update optimizer with new learning rate
+        parallel_state.optimizers[i] = optim.Adam(
+            policy.parameters(), 
+            lr=params["lr"],
+            eps=1e-5
+        )
+        
+        # Update scheduler with new learning rate
+        parallel_state.schedulers[i] = optim.lr_scheduler.OneCycleLR(
+            parallel_state.optimizers[i],
+            max_lr=params["lr"],
+            total_steps=cfg.num_updates,
+            pct_start=0.1,
+            anneal_strategy="cos",
+            div_factor=25.0,
+            final_div_factor=10000.0,
+        )
+        
+        # Update hyperparameters tensor
+        policy.register_buffer(
+            "_hyperparams_tensor",
+            torch.tensor([
+                params["lr"],
+                params["gamma"],
+                params["entropy_coef"],
+                params["value_loss_coef"],
+            ])
+        )
+
+def train_parallel(
+    dev, sim, cfg, actor_critic, update_cb, restore_ckpt=None, num_parallel_policies=4,
+    resample_interval=20,  # Resample less frequently
+    mutation_rate=0.1,     # Smaller mutations
+    elite_fraction=0.3,    # Keep more elites
+    transfer_ratio=0.5,    # How much to transfer from parent policies
+):
+    """Train multiple policies in parallel with evolutionary hyperparameter optimization."""
     print(f"Starting parallel training with {num_parallel_policies} policies")
     print(cfg)
 
@@ -648,120 +849,84 @@ def train_parallel(
     torch.backends.cudnn.allow_tf32 = True
 
     num_agents = sim.actions.shape[0]
-    total_worlds = sim.actions.shape[0] // 2  # Assuming 2 agents per world
+    total_worlds = sim.actions.shape[0] // 2
 
-    # Create multiple policies with different hyperparameters
+    # Initialize policies with random hyperparameters
     policies = []
     optimizers = []
     value_normalizers = []
     rollout_managers = []
     schedulers = []
 
-    # Default hyperparameters with wider ranges for exploration
+    # Default hyperparameters
     default_lr = cfg.lr
     default_gamma = cfg.gamma
     default_entropy = cfg.ppo.entropy_coef
     default_value = cfg.ppo.value_loss_coef
 
-    # Initialize amp before creating rollout managers
+    # Initialize amp
     amp = AMPState(dev, cfg.mixed_precision)
 
-    # Generate random hyperparameters for each policy
-    np.random.seed(42)  # Base seed for reproducibility
+    # Generate initial random hyperparameters with smaller variance
+    policy_lrs = np.exp(np.random.normal(0, 0.2, num_parallel_policies)) * default_lr
+    policy_gammas = np.exp(np.random.normal(0, 0.1, num_parallel_policies)) * default_gamma
+    policy_entropies = np.exp(np.random.normal(0, 0.2, num_parallel_policies)) * default_entropy
+    policy_values = np.exp(np.random.normal(0, 0.2, num_parallel_policies)) * default_value
 
-    # Generate diverse hyperparameters
-    policy_lrs = np.exp(np.random.normal(0, 0.8, num_parallel_policies)) * default_lr
-    policy_gammas = (
-        np.exp(np.random.normal(0, 0.3, num_parallel_policies)) * default_gamma
-    )
-    policy_entropies = (
-        np.exp(np.random.normal(0, 0.8, num_parallel_policies)) * default_entropy
-    )
-    policy_values = (
-        np.exp(np.random.normal(0, 0.8, num_parallel_policies)) * default_value
-    )
+    # Clamp initial values to reasonable ranges
+    policy_lrs = np.clip(policy_lrs, 1e-5, 1e-3)
+    policy_gammas = np.clip(policy_gammas, 0.95, 0.999)
+    policy_entropies = np.clip(policy_entropies, 0.001, 0.2)
+    policy_values = np.clip(policy_values, 0.1, 2.0)
 
-    # Convert to tensors for clamping
-    policy_lrs = torch.tensor(policy_lrs)
-    policy_gammas = torch.tensor(policy_gammas)
-    policy_entropies = torch.tensor(policy_entropies)
-    policy_values = torch.tensor(policy_values)
-
-    # Clamp values to reasonable ranges
-    policy_lrs = torch.clamp(policy_lrs, min=1e-5, max=1e-3)  # Wider LR range
-    policy_gammas = torch.clamp(
-        policy_gammas, min=0.95, max=0.999
-    )  # Higher minimum gamma
-    policy_entropies = torch.clamp(
-        policy_entropies, min=0.001, max=0.2
-    )  # Higher max entropy
-    policy_values = torch.clamp(
-        policy_values, min=0.1, max=2.0
-    )  # Wider value loss range
-
+    # Create initial policies
     for i in range(num_parallel_policies):
-        # Create policy with modified config
         policy = actor_critic.to(dev)
-
-        # Initialize weights with different scales for each policy
+        
+        # Initialize weights with smaller variance
         for param in policy.parameters():
-            if len(param.shape) > 1:  # Only initialize weights, not biases
+            if len(param.shape) > 1:
                 torch.nn.init.xavier_uniform_(
-                    param, gain=math.exp(torch.randn(1).item() * 0.5)
+                    param, gain=math.exp(torch.randn(1).item() * 0.1)
                 )
 
-        # Create optimizer with learning rate warmup
-        optimizer = optim.Adam(policy.parameters(), lr=policy_lrs[i].item(), eps=1e-5)
-
-        # Add learning rate scheduler with warmup
+        optimizer = optim.Adam(policy.parameters(), lr=policy_lrs[i], eps=1e-5)
         scheduler = optim.lr_scheduler.OneCycleLR(
             optimizer,
-            max_lr=policy_lrs[i].item(),
+            max_lr=policy_lrs[i],
             total_steps=cfg.num_updates,
-            pct_start=0.1,  # 10% warmup
+            pct_start=0.1,
             anneal_strategy="cos",
-            div_factor=25.0,  # Initial lr = max_lr/25
-            final_div_factor=10000.0,  # Final lr = max_lr/10000
+            div_factor=25.0,
+            final_div_factor=10000.0,
         )
 
         value_normalizer = EMANormalizer(
             cfg.value_normalizer_decay, disable=not cfg.normalize_values
-        )
-        value_normalizer = value_normalizer.to(dev)
+        ).to(dev)
 
-        # Create rollout manager for this policy
         rollout_mgr = RolloutManager(
-            dev,
-            sim,
-            cfg.steps_per_update,
-            cfg.num_bptt_chunks,
-            amp,
-            actor_critic.recurrent_cfg,
+            dev, sim, cfg.steps_per_update, cfg.num_bptt_chunks,
+            amp, actor_critic.recurrent_cfg
         )
 
-        # Store hyperparameters in policy for logging
         policy.hyperparams = {
-            "lr": float(policy_lrs[i].item()),  # Convert to Python float
-            "gamma": float(policy_gammas[i].item()),
-            "entropy_coef": float(policy_entropies[i].item()),
-            "value_loss_coef": float(policy_values[i].item()),
+            "lr": float(policy_lrs[i]),
+            "gamma": float(policy_gammas[i]),
+            "entropy_coef": float(policy_entropies[i]),
+            "value_loss_coef": float(policy_values[i]),
             "total_worlds": total_worlds,
         }
-
-        # Make hyperparams a property of the policy class
         policy._hyperparams = policy.hyperparams
 
-        # Store hyperparameters in the policy's state dict
         policy.register_buffer(
             "_hyperparams_tensor",
-            torch.tensor(
-                [
-                    policy._hyperparams["lr"],
-                    policy._hyperparams["gamma"],
-                    policy._hyperparams["entropy_coef"],
-                    policy._hyperparams["value_loss_coef"],
-                ]
-            ),
+            torch.tensor([
+                policy.hyperparams["lr"],
+                policy.hyperparams["gamma"],
+                policy.hyperparams["entropy_coef"],
+                policy.hyperparams["value_loss_coef"],
+            ])
         )
 
         policies.append(policy)
@@ -776,47 +941,48 @@ def train_parallel(
         value_normalizers=value_normalizers,
         rollout_managers=rollout_managers,
     )
+    parallel_state.schedulers = schedulers
 
-    if restore_ckpt != None:
-        # Load checkpoint into all policies
+    if restore_ckpt is not None:
         for policy in policies:
             policy.load_state_dict(torch.load(restore_ckpt))
         start_update_idx = 0
     else:
         start_update_idx = 0
 
-    if dev.type == "cuda":
-
-        def gpu_sync_fn():
+    def gpu_sync_fn():
+        if dev.type == "cuda":
             torch.cuda.synchronize()
-    else:
-
-        def gpu_sync_fn():
-            pass
 
     def update_iter_wrapper(
-        cfg,
-        amp,
-        num_train_seqs,
-        sim,
-        rollout_mgr,
-        advantages,
-        parallel_state,
-        scheduler,
-        update_idx,
-        writer,
+        cfg, amp, num_train_seqs, sim, rollout_mgr, advantages,
+        parallel_state, scheduler, update_idx, writer
     ):
+        # Resample hyperparameters periodically
+        if update_idx > 0 and update_idx % resample_interval == 0:
+            new_hyperparams = _resample_hyperparameters(
+                parallel_state,
+                num_parallel_policies,
+                default_lr,
+                default_gamma,
+                default_entropy,
+                default_value,
+                mutation_rate,
+                elite_fraction,
+                transfer_ratio
+            )
+            _update_hyperparameters(
+                parallel_state,
+                new_hyperparams,
+                dev,
+                cfg,
+                sim,
+                amp
+            )
+
         return _update_iter(
-            cfg,
-            amp,
-            num_train_seqs,
-            sim,
-            rollout_mgr,
-            advantages,
-            parallel_state,
-            scheduler,
-            update_idx,
-            writer,
+            cfg, amp, num_train_seqs, sim, rollout_mgr,
+            advantages, parallel_state, scheduler, update_idx, writer
         )
 
     _update_loop(
@@ -826,11 +992,10 @@ def train_parallel(
         cfg=cfg,
         num_agents=num_agents,
         sim=sim,
-        rollout_mgr=rollout_managers[0],  # Use first rollout manager as default
+        rollout_mgr=rollout_managers[0],
         parallel_state=parallel_state,
         start_update_idx=start_update_idx,
         writer=None,
     )
 
-    # Return best policy
     return parallel_state.policies[parallel_state.best_policy_idx]

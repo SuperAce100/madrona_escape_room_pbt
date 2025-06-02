@@ -29,6 +29,11 @@ class LearningCallback:
         self.ckpt_dir = ckpt_dir
         self.profile_report = profile_report
         self.writer = writer
+        self.success_count = 0
+        self.total_episodes = 0
+        self.room1_count = 0
+        self.room2_count = 0
+        self.room3_count = 0
 
     def __call__(self, update_idx, update_time, update_results, learning_state):
         update_id = update_idx + 1
@@ -57,6 +62,25 @@ class LearningCallback:
             bootstrap_value_min = update_results.bootstrap_values.min().cpu().item()
             bootstrap_value_max = update_results.bootstrap_values.max().cpu().item()
 
+            # Calculate success rates for each room
+            max_y = update_results.rewards.view(-1, args.num_worlds).max(dim=1)[0]
+            room1_success = (max_y >= 13.33).float().mean().item()  # First room
+            room2_success = (max_y >= 26.67).float().mean().item()  # Second room
+            room3_success = (max_y >= 40.0).float().mean().item()   # Third room (complete)
+
+            # Update counts
+            self.room1_count += room1_success * args.num_worlds
+            self.room2_count += room2_success * args.num_worlds
+            self.room3_count += room3_success * args.num_worlds
+            self.success_count += room3_success * args.num_worlds
+            self.total_episodes += args.num_worlds
+
+            # Calculate rates
+            room1_rate = self.room1_count / self.total_episodes
+            room2_rate = self.room2_count / self.total_episodes
+            room3_rate = self.room3_count / self.total_episodes
+            success_rate = self.success_count / self.total_episodes
+
             # Handle both single and parallel training states
             if hasattr(learning_state, "value_normalizer"):
                 vnorm_mu = learning_state.value_normalizer.mu.cpu().item()
@@ -65,9 +89,7 @@ class LearningCallback:
                 # For parallel training, use the best policy's normalizer
                 best_idx = learning_state.best_policy_idx
                 vnorm_mu = learning_state.value_normalizers[best_idx].mu.cpu().item()
-                vnorm_sigma = (
-                    learning_state.value_normalizers[best_idx].sigma.cpu().item()
-                )
+                vnorm_sigma = learning_state.value_normalizers[best_idx].sigma.cpu().item()
 
         # Log to TensorBoard if writer is available
         if self.writer is not None:
@@ -93,15 +115,9 @@ class LearningCallback:
             self.writer.add_scalar("advantages/max", advantage_max, update_id)
 
             # Log bootstrap values
-            self.writer.add_scalar(
-                "bootstrap_values/mean", bootstrap_value_mean, update_id
-            )
-            self.writer.add_scalar(
-                "bootstrap_values/min", bootstrap_value_min, update_id
-            )
-            self.writer.add_scalar(
-                "bootstrap_values/max", bootstrap_value_max, update_id
-            )
+            self.writer.add_scalar("bootstrap_values/mean", bootstrap_value_mean, update_id)
+            self.writer.add_scalar("bootstrap_values/min", bootstrap_value_min, update_id)
+            self.writer.add_scalar("bootstrap_values/max", bootstrap_value_max, update_id)
 
             # Log returns
             self.writer.add_scalar("returns/mean", ppo.returns_mean, update_id)
@@ -115,6 +131,18 @@ class LearningCallback:
             self.writer.add_scalar("performance/fps", fps, update_id)
             self.writer.add_scalar("performance/mean_fps", self.mean_fps, update_id)
             self.writer.add_scalar("performance/update_time", update_time, update_id)
+
+            # Log success rates
+            self.writer.add_scalar("success/room1_rate", room1_rate, update_id)
+            self.writer.add_scalar("success/room2_rate", room2_rate, update_id)
+            self.writer.add_scalar("success/room3_rate", room3_rate, update_id)
+            self.writer.add_scalar("success/total_rate", success_rate, update_id)
+            self.writer.add_scalar("success/room1_episode", room1_success, update_id)
+            self.writer.add_scalar("success/room2_episode", room2_success, update_id)
+            self.writer.add_scalar("success/room3_episode", room3_success, update_id)
+
+            # Log max_y as a scalar
+            self.writer.add_scalar("success/max_y", max_y.mean().item(), update_id)
 
             if torch.cuda.is_available():
                 self.writer.add_scalar(
@@ -130,41 +158,45 @@ class LearningCallback:
 
             # Log parallel training specific metrics
             if hasattr(learning_state, "policy_returns"):
+                for i, ret in enumerate(learning_state.policy_returns):
+                    self.writer.add_scalar(f"policy_{i}/returns", ret, update_id)
+                self.writer.add_scalar("best/best_policy_idx", learning_state.best_policy_idx, update_id)
                 self.writer.add_scalar(
                     "best/best_policy_return",
                     learning_state.policy_returns[learning_state.best_policy_idx],
                     update_id,
                 )
-                self.writer.add_scalar(
-                    "best/best_policy_loss",
-                    learning_state.best_policy_stats[-1].loss,
-                    update_id,
-                )
-                self.writer.add_scalar(
-                    "best/best_policy_action_loss",
-                    learning_state.best_policy_stats[-1].action_loss,
-                    update_id,
-                )
-                self.writer.add_scalar(
-                    "best/best_policy_value_loss",
-                    learning_state.best_policy_stats[-1].value_loss,
-                    update_id,
-                )
-                self.writer.add_scalar(
-                    "best/best_policy_entropy_loss",
-                    learning_state.best_policy_stats[-1].entropy_loss,
-                    update_id,
-                )
-                self.writer.add_scalar(
-                    "best/best_policy_returns_mean",
-                    learning_state.best_policy_stats[-1].returns_mean,
-                    update_id,
-                )
-                self.writer.add_scalar(
-                    "best/best_policy_returns_stddev",
-                    learning_state.best_policy_stats[-1].returns_stddev,
-                    update_id,
-                )
+                if learning_state.best_policy_stats:
+                    self.writer.add_scalar(
+                        "best/best_policy_loss",
+                        learning_state.best_policy_stats[-1].loss,
+                        update_id,
+                    )
+                    self.writer.add_scalar(
+                        "best/best_policy_action_loss",
+                        learning_state.best_policy_stats[-1].action_loss,
+                        update_id,
+                    )
+                    self.writer.add_scalar(
+                        "best/best_policy_value_loss",
+                        learning_state.best_policy_stats[-1].value_loss,
+                        update_id,
+                    )
+                    self.writer.add_scalar(
+                        "best/best_policy_entropy_loss",
+                        learning_state.best_policy_stats[-1].entropy_loss,
+                        update_id,
+                    )
+                    self.writer.add_scalar(
+                        "best/best_policy_returns_mean",
+                        learning_state.best_policy_stats[-1].returns_mean,
+                        update_id,
+                    )
+                    self.writer.add_scalar(
+                        "best/best_policy_returns_stddev",
+                        learning_state.best_policy_stats[-1].returns_stddev,
+                        update_id,
+                    )
 
         print(f"\nUpdate: {update_id}")
         print(
@@ -187,38 +219,16 @@ class LearningCallback:
             f"    Returns          => Avg: {ppo.returns_mean}, σ: {ppo.returns_stddev}"
         )
         print(f"    Value Normalizer => Mean: {vnorm_mu: .3e}, σ: {vnorm_sigma:.3e}")
+        print(f"    Success Rates:")
+        print(f"        Room 1: {room1_rate:.3f}")
+        print(f"        Room 2: {room2_rate:.3f}")
+        print(f"        Room 3: {room3_rate:.3f}")
+        print(f"        Total:  {success_rate:.3f}")
 
         if hasattr(learning_state, "policy_returns"):
-            print(f"\n    Policy Returns:")
-            for i, ret in enumerate(learning_state.policy_returns):
-                print(f"        Policy {i}: {ret:.3e}")
+            print(f"\n    Policy Returns: {learning_state.policy_returns}")
             print(f"    Best Policy: {learning_state.best_policy_idx}")
 
-            # Print best policy's stats
-            if learning_state.best_policy_stats:
-                best_stats = learning_state.best_policy_stats[-1]
-                print("\n    Best Policy Stats:")
-                print(f"        Loss: {best_stats.loss: .3e}")
-                print(f"        Action Loss: {best_stats.action_loss: .3e}")
-                print(f"        Value Loss: {best_stats.value_loss: .3e}")
-                print(f"        Entropy Loss: {best_stats.entropy_loss: .3e}")
-                print(f"        Returns Mean: {best_stats.returns_mean: .3e}")
-                print(f"        Returns StdDev: {best_stats.returns_stddev: .3e}")
-
-            print("\n    Policy Hyperparameters:")
-            for i, policy in enumerate(learning_state.policies):
-                print(f"        Policy {i}:")
-                # Access hyperparameters from the policy's state dict
-                hyperparams = {
-                    "lr": policy._hyperparams_tensor[0].item(),
-                    "gamma": policy._hyperparams_tensor[1].item(),
-                    "entropy_coef": policy._hyperparams_tensor[2].item(),
-                    "value_loss_coef": policy._hyperparams_tensor[3].item(),
-                }
-                print(f"            LR: {hyperparams['lr']:.2e}")
-                print(f"            Gamma: {hyperparams['gamma']:.4f}")
-                print(f"            Entropy: {hyperparams['entropy_coef']:.2e}")
-                print(f"            Value Loss: {hyperparams['value_loss_coef']:.2e}")
 
         if self.profile_report:
             print()
@@ -364,6 +374,10 @@ if __name__ == "__main__":
                 learning_cb,
                 restore_ckpt,
                 num_parallel_policies=args.num_parallel_policies,
+                resample_interval=10,
+                mutation_rate=0.1,
+                elite_fraction=0.3,
+                transfer_ratio=0.75,
             )
         else:
             train_parallel(
