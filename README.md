@@ -153,3 +153,41 @@ If you use Madrona in a research project, please cite our SIGGRAPH paper.
     year    = {2023}
 }
 ```
+
+Population Based Training (PBT)
+--------------------------------
+
+This implementation uses Population Based Training (PBT) to optimize policy hyperparameters through evolutionary search. The algorithm maintains a population of N policies, each with independent hyperparameters, and periodically evolves them based on performance.
+
+### Algorithm
+
+1. **Fitness Evaluation**
+   - Each policy is evaluated over K=5 episodes
+   - Fitness score = mean episode reward
+   - Episodes run in parallel using the Madrona simulator
+   - RNN states are properly managed across episodes
+   - Evaluation uses deterministic action selection (best action from policy distribution)
+
+2. **Evolution**
+   - Sort policies by fitness
+   - Preserve top M = ⌈N * elite_fraction⌉ policies
+   - For remaining N-M policies:
+     - Select parent from top M policies uniformly
+     - Copy parent's weights
+     - With probability mutation_rate:
+       - Mutate learning rate: lr_new = lr_old * U(1 ± mutation_scale)
+     - Initialize new optimizer with mutated hyperparameters
+
+3. **Training Integration**
+   - PPO updates continue between evolution steps
+   - Evolution occurs every eval_interval updates
+   - Best policy is checkpointed when fitness improves
+
+### Usage
+
+```bash
+python scripts/train.py --pbt --population-size 8 --elite-fraction 0.2 \
+    --mutation-rate 0.1 --mutation-scale 0.2 --eval-interval 500
+```
+
+The implementation is integrated with TensorBoard for monitoring population statistics, individual policy performance, and hyperparameter evolution.
