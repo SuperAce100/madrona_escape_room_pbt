@@ -370,20 +370,20 @@ def train(dev, sim, cfg, actor_critic, update_cb, restore_ckpt=None):
         # Start with first policy
         learning_state = population[0]
     else:
-    actor_critic = actor_critic.to(dev)
-    optimizer = optim.Adam(actor_critic.parameters(), lr=cfg.lr)
-    amp = AMPState(dev, cfg.mixed_precision)
-    value_normalizer = EMANormalizer(cfg.value_normalizer_decay,
-                                     disable=not cfg.normalize_values)
-    value_normalizer = value_normalizer.to(dev)
-
-    learning_state = LearningState(
+        actor_critic = actor_critic.to(dev)
+        optimizer = optim.Adam(actor_critic.parameters(), lr=cfg.lr)
+        amp = AMPState(dev, cfg.mixed_precision)
+        value_normalizer = EMANormalizer(cfg.value_normalizer_decay,
+                                      disable=not cfg.normalize_values)
+        value_normalizer = value_normalizer.to(dev)
+        
+        learning_state = LearningState(
             policy=actor_critic,
             optimizer=optimizer,
             scheduler=None,
             value_normalizer=value_normalizer,
             amp=amp,
-    )
+        )
 
     if restore_ckpt != None:
         start_update_idx = learning_state.load(restore_ckpt)
